@@ -33,6 +33,7 @@ func usage() {
 	out("  uninstall [-k] %s", tr("CmdUninstall", "remove service and restore stock termsrv (-k keeps RDP settings)"))
 	out("  status         %s", tr("CmdStatus", "show version, support, service and patch state"))
 	out("  update [url]   %s", tr("CmdUpdate", "download latest patch database (rdpwrap.ini)"))
+	out("                 %s", tr("UpdateNotice", "Note: the INI contains unsigned patch bytes written into TermService; update only from a trusted source."))
 	out("  patch          %s", tr("CmdPatch", "apply patches once now (without the service)"))
 	out("  service        %s", tr("CmdService", "run as Windows service (internal)"))
 	out("  help           %s", tr("CmdHelp", "show this help"))

@@ -373,6 +373,7 @@ func Update(source string, log *logx.Logger) error {
 	if source == "" {
 		source = patcher.DefaultINIURL
 	}
+	log.Info("%s", loc.L("RdpMux", "UpdateNotice", "Note: the INI contains unsigned patch bytes written into TermService; update only from a trusted source."))
 	sourceLabel := "HTTPS"
 	if parsed, parseErr := url.Parse(source); parseErr == nil && parsed.Host != "" {
 		sourceLabel = parsed.Host

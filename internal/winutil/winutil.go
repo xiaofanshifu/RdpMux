@@ -5,19 +5,12 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
-var (
-	kernel32             = windows.NewLazySystemDLL("kernel32.dll")
-	procWow64Disable     = kernel32.NewProc("Wow64DisableWow64FsRedirection")
-	procWow64Revert      = kernel32.NewProc("Wow64RevertWow64FsRedirection")
-	oldWow64Value        uintptr
-	programFilesReplacer = regexp.MustCompile(`(?i)%ProgramFiles%`)
-)
+var programFilesReplacer = regexp.MustCompile(`(?i)%ProgramFiles%`)
 
 func Is64BitOS() bool {
 	if runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64" {
@@ -32,18 +25,6 @@ func Is64BitOS() bool {
 		return wow64
 	}
 	return false
-}
-
-func DisableWow64Redirection() {
-	if runtime.GOARCH == "386" {
-		procWow64Disable.Call(uintptr(unsafe.Pointer(&oldWow64Value)))
-	}
-}
-
-func RevertWow64Redirection() {
-	if runtime.GOARCH == "386" {
-		procWow64Revert.Call(oldWow64Value)
-	}
 }
 
 func ExpandPath(path string) string {

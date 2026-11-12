@@ -3,6 +3,8 @@ package loc
 import (
 	"sync"
 	"testing"
+
+	"rdpmux/internal/assets"
 )
 
 func withLanguageState(t *testing.T) {
@@ -167,5 +169,15 @@ func TestExternalPartialTargetKeepsEmbeddedTarget(t *testing.T) {
 	}
 	if got := L("MainForm", "bOK.Caption", ""); got == "" {
 		t.Error("embedded zh-CN key was lost after a partial external override")
+	}
+}
+
+func TestUpdateNoticeInPublishedLanguages(t *testing.T) {
+	for _, code := range []string{"en-US", "zh-CN"} {
+		values := map[string]string{}
+		parseInto(string(assets.Lang(code)), values)
+		if values["RdpMux.UpdateNotice"] == "" {
+			t.Errorf("%s: missing RdpMux.UpdateNotice", code)
+		}
 	}
 }
