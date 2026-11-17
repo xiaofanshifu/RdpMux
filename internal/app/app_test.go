@@ -13,7 +13,6 @@ import (
 	"rdpmux/internal/assets"
 	"rdpmux/internal/loc"
 	"rdpmux/internal/logx"
-	"rdpmux/internal/patcher"
 )
 
 func TestNewLoggerReportsFileFailureWithoutConsole(t *testing.T) {
@@ -202,37 +201,5 @@ func TestReadInstallPatchDB(t *testing.T) {
 	data, err = readInstallPatchDB(installDir, exeDir)
 	if err != nil || !bytes.Equal(data, installINI) {
 		t.Fatalf("expected existing install-dir INI to take priority: %v", err)
-	}
-}
-
-func TestTermServiceRestartNeeded(t *testing.T) {
-	const v = "10.0.19041.7811"
-	newDB, err := patcher.LoadDB(assets.ConfigINI, "x64")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if termServiceRestartNeeded(assets.ConfigINI, newDB, v, "x64") {
-		t.Fatal("unchanged database requested a TermService restart")
-	}
-	newDB.Specs[v].LocalOnly.Offset++
-	if !termServiceRestartNeeded(assets.ConfigINI, newDB, v, "x64") {
-		t.Fatal("changed patch offset did not request a TermService restart")
-	}
-	newDB.Specs[v].LocalOnly.Offset--
-	newDB.Specs[v].SLInitGlobals["bServerSku"] += 4
-	if !termServiceRestartNeeded(assets.ConfigINI, newDB, v, "x64") {
-		t.Fatal("changed SLInit global did not request a TermService restart")
-	}
-	newDB.Specs[v].SLInitGlobals["bServerSku"] -= 4
-	// A change to a different version must not force a restart for this one.
-	newDB.Specs["10.0.19041.7725"].LocalOnly.Offset++
-	if termServiceRestartNeeded(assets.ConfigINI, newDB, v, "x64") {
-		t.Fatal("unrelated version change requested a restart for this version")
-	}
-	if termServiceRestartNeeded(assets.ConfigINI, newDB, "10.0.99999.1", "x64") {
-		t.Fatal("version absent from the old database requested a restart")
-	}
-	if termServiceRestartNeeded([]byte("not an ini"), newDB, v, "x64") {
-		t.Fatal("unreadable old database requested a restart")
 	}
 }

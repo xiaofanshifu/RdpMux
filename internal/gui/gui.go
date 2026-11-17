@@ -197,7 +197,7 @@ func (u *ui) build() error {
 							CheckBox{AssignTo: &u.cbAllow, Text: mf("cbAllowTSConnections.Caption", "Enable Remote Desktop"), OnCheckedChanged: u.markDirty},
 							Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
 								Label{Text: mf("lRDPPort.Caption", "RDP port:"), MinSize: Size{Width: 110}},
-								NumberEdit{AssignTo: &u.nePort, MinValue: 1, MaxValue: 65535, Decimals: 0, OnValueChanged: u.markDirty, MaxSize: Size{Width: 100}},
+								NumberEdit{AssignTo: &u.nePort, MinValue: 1, MaxValue: 65535, Decimals: 0, OnValueChanged: u.markDirty, MaxSize: Size{Width: 100}, ToolTipText: mf("nePort.ToolTip", "Make sure Windows Firewall allows this port; RdpMux does not manage firewall rules.")},
 							}},
 							CheckBox{AssignTo: &u.cbSingle, Text: mf("cbSingleSessionPerUser.Caption", "Single session per user"), OnCheckedChanged: u.markDirty},
 							CheckBox{AssignTo: &u.cbHide, Text: mf("cbHideUsers.Caption", "Hide users on logon screen"), OnCheckedChanged: u.markDirty},
@@ -219,19 +219,26 @@ func (u *ui) build() error {
 							PushButton{Text: mf("b1920x1080.Caption", "1920x1080"), OnClicked: func() { u.mstsc("/w:1920 /h:1080") }},
 						},
 					},
-					Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
-						PushButton{Text: mf("bInstall.Caption", "Install"), OnClicked: func() {
-							u.runOp(msg("OpInstall", "install"), func(log *logx.Logger) error { return app.Install(log) })
+					Composite{Layout: VBox{Spacing: 6}, Children: []Widget{
+						Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
+							PushButton{Text: mf("bInstall.Caption", "Install"), OnClicked: func() {
+								u.runOp(msg("OpInstall", "install"), func(log *logx.Logger) error { return app.Install(log) })
+							}},
+							PushButton{Text: mf("bUninstall.Caption", "Uninstall"), OnClicked: u.onUninstall},
+							PushButton{Text: mf("bUpdateINI.Caption", "Update INI"), ToolTipText: mf("bUpdateINI.ToolTip", "Only downloads the latest patch database from GitHub; it does not apply it. Use Restart Service to apply."), OnClicked: func() {
+								u.runOp(msg("OpUpdate", "update"), func(log *logx.Logger) error { return app.Update("", log) })
+							}},
 						}},
-						PushButton{Text: mf("bUninstall.Caption", "Uninstall"), OnClicked: u.onUninstall},
-						PushButton{Text: mf("bUpdateINI.Caption", "Update INI"), OnClicked: func() {
-							u.runOp(msg("OpUpdate", "update"), func(log *logx.Logger) error { return app.Update("", log) })
-						}},
-						PushButton{Text: mf("bRestartTS.Caption", "Restart TermService"), OnClicked: func() {
-							u.runOp(msg("OpRestart", "restart"), func(log *logx.Logger) error {
-								log.Info("%s", msg("LogRestartingTermService", "restarting TermService..."))
-								return sysconfig.RestartTermService()
-							})
+						Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
+							PushButton{Text: mf("bRestartService.Caption", "Restart Service"), ToolTipText: mf("bRestartService.ToolTip", "Restarts the RdpMux service to load and apply the current patch database. If the patches for the running termsrv version changed, TermService is also restarted (active RDP sessions disconnect)."), OnClicked: func() {
+								u.runOp(msg("OpRestartService", "restart service"), func(log *logx.Logger) error { return app.RestartService(log) })
+							}},
+							PushButton{Text: mf("bRestartTS.Caption", "Restart TermService"), ToolTipText: mf("bRestartTS.ToolTip", "Restarts TermService only (disconnects active RDP sessions). Does not reload the patch database; use Restart Service to apply an updated database."), OnClicked: func() {
+								u.runOp(msg("OpRestart", "restart"), func(log *logx.Logger) error {
+									log.Info("%s", msg("LogRestartingTermService", "restarting TermService..."))
+									return sysconfig.RestartTermService()
+								})
+							}},
 						}},
 					}},
 					TextEdit{AssignTo: &u.log, ReadOnly: true, VScroll: true, MinSize: Size{Height: 90}},
@@ -448,7 +455,7 @@ func (u *ui) onUninstall() {
 	if walk.MsgBox(u.mw, msg("Warning", "Warning"), msgText, walk.MsgBoxYesNo|walk.MsgBoxIconWarning) != win.IDYES {
 		return
 	}
-	u.runOp(msg("OpUninstall", "uninstall"), func(log *logx.Logger) error { return app.Uninstall(false, log) })
+	u.runOp(msg("OpUninstall", "uninstall"), func(log *logx.Logger) error { return app.Uninstall(log) })
 }
 
 func (u *ui) stopped() bool {

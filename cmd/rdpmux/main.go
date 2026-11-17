@@ -30,10 +30,11 @@ func usage() {
 	out("%s", tr("UsageLine", "Usage: rdpmux <command> [options]"))
 	out("")
 	out("  install        %s", tr("CmdInstall", "enable RDP, deploy files and start the patch service"))
-	out("  uninstall [-k] %s", tr("CmdUninstall", "remove service and restore stock termsrv (-k keeps RDP settings)"))
+	out("  uninstall      %s", tr("CmdUninstall", "remove service and restore stock single-session termsrv (keeps RDP enabled)"))
 	out("  status         %s", tr("CmdStatus", "show version, support, service and patch state"))
 	out("  update [url]   %s", tr("CmdUpdate", "download latest patch database (rdpwrap.ini)"))
 	out("                 %s", tr("UpdateNotice", "Note: the INI contains unsigned patch bytes written into TermService; update only from a trusted source."))
+	out("  restart        %s", tr("CmdRestart", "restart the patch service to apply the current database"))
 	out("  patch          %s", tr("CmdPatch", "apply patches once now (without the service)"))
 	out("  service        %s", tr("CmdService", "run as Windows service (internal)"))
 	out("  help           %s", tr("CmdHelp", "show this help"))
@@ -184,13 +185,9 @@ func parseFlags(args []string) (logx.Level, []string, error) {
 	if len(rest) > 0 {
 		rest[0] = strings.ToLower(rest[0])
 		switch rest[0] {
-		case "install", "status", "patch", "service", "help":
+		case "install", "uninstall", "status", "restart", "patch", "service", "help":
 			if len(rest) != 1 {
 				return 0, nil, fmt.Errorf("%s", tr("ErrUnexpectedArguments", "%s does not accept positional arguments or extra options", rest[0]))
-			}
-		case "uninstall":
-			if len(rest) > 2 || len(rest) == 2 && rest[1] != "-k" && rest[1] != "--keep" {
-				return 0, nil, fmt.Errorf("%s", tr("ErrUninstallArguments", "uninstall accepts only -k or --keep"))
 			}
 		case "update":
 			if len(rest) > 2 || len(rest) == 2 && !strings.HasPrefix(strings.ToLower(rest[1]), "https://") {
@@ -205,7 +202,7 @@ func parseFlags(args []string) (logx.Level, []string, error) {
 
 func needsElevation(cmd string) bool {
 	switch cmd {
-	case "install", "uninstall", "update", "patch":
+	case "install", "uninstall", "update", "restart", "patch":
 		return true
 	}
 	return false
@@ -249,10 +246,9 @@ func run() error {
 		defer closeLog()
 		return app.Install(log)
 	case "uninstall":
-		keep := len(args) > 1 && (args[1] == "-k" || args[1] == "--keep")
 		log, closeLog := app.NewLogger(level, os.Stdout)
 		defer closeLog()
-		return app.Uninstall(keep, log)
+		return app.Uninstall(log)
 	case "status":
 		log, closeLog := app.NewLogger(level, nil)
 		defer closeLog()
@@ -266,6 +262,10 @@ func run() error {
 		log, closeLog := app.NewLogger(level, os.Stdout)
 		defer closeLog()
 		return app.Update(source, log)
+	case "restart":
+		log, closeLog := app.NewLogger(level, os.Stdout)
+		defer closeLog()
+		return app.RestartService(log)
 	case "patch":
 		log, closeLog := app.NewLogger(level, os.Stdout)
 		defer closeLog()

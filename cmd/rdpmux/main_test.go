@@ -30,9 +30,9 @@ func TestParseFlagsHelpCannotUninstall(t *testing.T) {
 	}
 }
 
-func TestParseFlagsKeepsUninstallOption(t *testing.T) {
-	_, args, err := parseFlags([]string{"-lang", "zh-CN", "uninstall", "-v", "-k"})
-	if err != nil || !reflect.DeepEqual(args, []string{"uninstall", "-k"}) {
+func TestParseFlagsUninstallAcceptsGlobalFlags(t *testing.T) {
+	_, args, err := parseFlags([]string{"-lang", "zh-CN", "uninstall", "-v"})
+	if err != nil || !reflect.DeepEqual(args, []string{"uninstall"}) {
 		t.Fatalf("%v %v", args, err)
 	}
 }
@@ -70,8 +70,8 @@ func TestParseFlagsChineseErrorsAndHelp(t *testing.T) {
 		{"extra patch option", []string{"patch", "--unknown"}, "patch 不接受位置参数或额外选项"},
 		{"extra service argument", []string{"service", "extra"}, "service 不接受位置参数或额外选项"},
 		{"extra help argument", []string{"help", "extra"}, "help 不接受位置参数或额外选项"},
-		{"invalid uninstall option", []string{"uninstall", "--unknown"}, "uninstall 仅接受 -k 或 --keep"},
-		{"extra uninstall argument", []string{"uninstall", "-k", "extra"}, "uninstall 仅接受 -k 或 --keep"},
+		{"invalid uninstall option", []string{"uninstall", "--unknown"}, "uninstall 不接受位置参数或额外选项"},
+		{"extra uninstall argument", []string{"uninstall", "-k", "extra"}, "uninstall 不接受位置参数或额外选项"},
 		{"insecure update URL", []string{"update", "http://example.invalid/patch.ini"}, "update 仅接受一个 HTTPS URL"},
 		{"invalid update option", []string{"update", "--unknown"}, "update 仅接受一个 HTTPS URL"},
 		{"extra update argument", []string{"update", "https://example.invalid/patch.ini", "extra"}, "update 仅接受一个 HTTPS URL"},

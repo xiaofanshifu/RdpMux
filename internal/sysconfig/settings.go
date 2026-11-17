@@ -48,28 +48,6 @@ func nlaSelection(security, auth uint32) int {
 	}
 }
 
-func readRDPPort() (uint32, error) {
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, RegRDPTcp, winutil.RegAccess(false))
-	if errors.Is(err, registry.ErrNotExist) {
-		return 3389, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	defer k.Close()
-	port, kind, err := k.GetIntegerValue("PortNumber")
-	if errors.Is(err, registry.ErrNotExist) {
-		return 3389, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	if kind != registry.DWORD || port < 1 || port > 65535 {
-		return 0, fmt.Errorf("unsupported RDP PortNumber: type=%d value=%d", kind, port)
-	}
-	return uint32(port), nil
-}
-
 func ReadSettings() Settings {
 	s := Settings{Port: 3389, NLA: -1, Shadow: -1}
 	if k, err := registry.OpenKey(registry.LOCAL_MACHINE, RegTS, winutil.RegAccess(false)); err == nil {
@@ -157,7 +135,7 @@ func settingsValues(s Settings) []rdpSetting {
 	if s.Shadow >= 0 {
 		values = append(values, rdpSetting{RegRDPTcp, "Shadow", uint32(s.Shadow)}, rdpSetting{RegTSPolicy, "Shadow", uint32(s.Shadow)})
 	}
-	// Commit the port only after the firewall and all other writes succeeded.
+	// Commit the port last so a failed write leaves the previous port intact.
 	return append(values, rdpSetting{RegRDPTcp, "PortNumber", s.Port})
 }
 
@@ -165,21 +143,7 @@ func WriteSettings(s Settings) error {
 	if err := validateSettings(s); err != nil {
 		return err // Validate external selections before any system access.
 	}
-	// Read the actual port: the caller's oldPort may be a stale GUI snapshot.
-	oldPort, err := readRDPPort()
-	if err != nil {
-		return err
-	}
 	changes := &rdpChanges{}
-	if oldPort != s.Port {
-		rules, err := readRDPFirewallRules()
-		if err != nil {
-			return err
-		}
-		if err := changes.configureFirewall(s.Port, rules, runNetsh); err != nil {
-			return changes.fail(err)
-		}
-	}
 	for _, value := range settingsValues(s) {
 		if err := changes.setValue(value.path, value.name, value.value); err != nil {
 			return changes.fail(err)

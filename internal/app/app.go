@@ -358,17 +358,25 @@ func Install(log *logx.Logger) (err error) {
 	return nil
 }
 
-func Uninstall(keep bool, log *logx.Logger) error {
+func Uninstall(log *logx.Logger) error {
 	unlock, err := beginOperation()
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	if _, stateErr := winsvc.State(); stateErr != nil {
-		if errors.Is(stateErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+	_, stateErr := winsvc.State()
+	if stateErr != nil && !errors.Is(stateErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+		return stateErr
+	}
+	if stateErr != nil {
+		// The service is already gone. A previous uninstall may have been
+		// interrupted (restarting TermService can drop the RDP session running
+		// it), so resume cleanup while any RdpMux footprint remains; refuse
+		// only when there is nothing left to remove.
+		if _, err := os.Stat(sysconfig.InstallDir()); os.IsNotExist(err) {
 			return fmt.Errorf("%s", tr("SvcNotInstalled", "service %s is not installed", winsvc.Name))
 		}
-		return stateErr
+		log.Info("%s", tr("LogUninstallResume", "service already removed; completing cleanup of remaining RdpMux files and settings"))
 	}
 	log.Info("%s", tr("LogRemovingService", "removing patch service..."))
 	if err := winsvc.Remove(); err != nil {
@@ -378,12 +386,7 @@ func Uninstall(keep bool, log *logx.Logger) error {
 	if err := sysconfig.RestartTermService(); err != nil {
 		return err
 	}
-	if !keep {
-		log.Info("%s", tr("LogRestoringRDP", "disabling Remote Desktop and removing RdpMux firewall rules..."))
-		if err := sysconfig.DisableRDP(); err != nil {
-			return err
-		}
-	}
+	log.Info("%s", tr("LogUninstallKeepRDP", "Remote Desktop remains enabled with stock single-session behavior"))
 	dir := sysconfig.InstallDir()
 	var cleanupErr error
 	for _, name := range []string{"rdpmux.exe", "rdpmuxgui.exe", "rdpwrap.ini", "rdpmux.log", "rdpmux.log.1", "rdpmux.conf"} {
@@ -467,21 +470,63 @@ func verifyServicePatches(db *patcher.DB, log *logx.Logger) error {
 	return nil
 }
 
-// termServiceRestartNeeded reports whether the patch spec for the running
-// termsrv version changed between the old and new database. Already-applied
-// bytes cannot be replaced in place, so a changed spec requires restarting
-// TermService; an unchanged spec (e.g. only new versions added) does not.
-func termServiceRestartNeeded(oldContent []byte, newDB *patcher.DB, version, arch string) bool {
-	oldDB, err := patcher.LoadDB(oldContent, arch)
+// RestartService restarts the patch service so it reloads the on-disk patch
+// database and applies it. Updating the database alone does not apply it; this
+// is the explicit apply step. If the running TermService already holds patches
+// that differ from the new database, TermService is restarted first to clear
+// them, since they cannot be replaced in place.
+func RestartService(log *logx.Logger) error {
+	unlock, err := beginOperation()
 	if err != nil {
-		return false
+		return err
 	}
-	oldSpec, ok := oldDB.Spec(version)
-	if !ok {
-		return false
+	defer unlock()
+	if _, stateErr := winsvc.State(); stateErr != nil {
+		if errors.Is(stateErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return fmt.Errorf("%s", tr("SvcNotInstalled", "service %s is not installed", winsvc.Name))
+		}
+		return stateErr
 	}
-	newSpec, _ := newDB.Spec(version)
-	return !oldSpec.Equal(newSpec)
+	db, err := loadDB()
+	if err != nil {
+		return err
+	}
+	if stale, staleErr := stalePatchesInMemory(db); staleErr != nil {
+		log.Warn("%s", tr("LogStaleCheckWarn", "could not inspect current patches: %s", staleErr))
+	} else if stale {
+		log.Info("%s", tr("LogRestartingTermService", "restarting TermService to clear patches (active RDP sessions will disconnect)..."))
+		if err := sysconfig.RestartTermService(); err != nil {
+			return err
+		}
+	}
+	log.Info("%s", tr("LogRestartingPatchService", "restarting patch service..."))
+	if err := winsvc.Restart(); err != nil {
+		return err
+	}
+	if err := verifyServicePatches(db, log); err != nil {
+		return err
+	}
+	log.Info("%s", tr("LogServiceRestarted", "patch service restarted; current database applied"))
+	return nil
+}
+
+// stalePatchesInMemory reports whether the running TermService holds code
+// patches that differ from db (neither stock nor the target bytes), which would
+// block applying db in place. It returns false when TermService is not running.
+func stalePatchesInMemory(db *patcher.DB) (bool, error) {
+	state, pid, err := sysconfig.TermServiceState()
+	if err != nil {
+		return false, err
+	}
+	if state != uint32(svc.Running) || pid == 0 {
+		return false, nil
+	}
+	p, err := patcher.New(pid, db, sysconfig.Arch(), nil)
+	if err != nil {
+		return false, err
+	}
+	defer p.Close()
+	return p.StaleCode()
 }
 
 func Update(source string, log *logx.Logger) error {
@@ -529,21 +574,7 @@ func Update(source string, log *logx.Logger) error {
 		}
 		log.Info("%s", tr("LogDBUpdated", "patch database updated (%d -> %d)", oldDate, newDate))
 	}
-	if st, err := winsvc.State(); err == nil && st == svc.Running {
-		if termServiceRestartNeeded(old, db, fv.String(), sysconfig.Arch()) {
-			log.Info("%s", tr("LogUpdateRestartingTermService", "patch data for termsrv %s changed; restarting TermService to clear old patches (active RDP sessions will disconnect)...", fv.String()))
-			if err := sysconfig.RestartTermService(); err != nil {
-				return err
-			}
-		}
-		log.Info("%s", tr("LogRestartingPatchService", "restarting patch service..."))
-		if err := winsvc.Restart(); err != nil {
-			return err
-		}
-		if err := verifyServicePatches(db, log); err != nil {
-			return err
-		}
-	}
+	log.Info("%s", tr("LogUpdateApplyHint", "download complete; restart the patch service to apply the new database"))
 	return nil
 }
 

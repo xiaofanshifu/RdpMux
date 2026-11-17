@@ -274,43 +274,22 @@ func TestValidateTargetsRejectsOverlapAndExecutableGlobals(t *testing.T) {
 	}
 }
 
-func TestSpecEqual(t *testing.T) {
-	base := &Spec{
-		LocalOnly:     &CodePatch{Name: "LocalOnly", Offset: 0x1000, Code: []byte{0xEB}},
-		SingleUser:    &CodePatch{Name: "SingleUser", Offset: 0x2000, Code: []byte{0xB8, 1, 0, 0, 0}},
-		SLInitGlobals: map[string]uint32{"bInitialized": 0x3000, "bServerSku": 0x3004},
+func TestStaleCode(t *testing.T) {
+	p, m := testPatcher()
+	if stale, err := p.StaleCode(); err != nil || stale {
+		t.Fatalf("stock memory reported stale: %v %v", stale, err)
 	}
-	clone := &Spec{
-		LocalOnly:     &CodePatch{Name: "LocalOnly", Offset: 0x1000, Code: []byte{0xEB}},
-		SingleUser:    &CodePatch{Name: "SingleUser", Offset: 0x2000, Code: []byte{0xB8, 1, 0, 0, 0}},
-		SLInitGlobals: map[string]uint32{"bInitialized": 0x3000, "bServerSku": 0x3004},
+	m.memory[0x1010] = 0xEB // already patched with the target byte
+	if stale, err := p.StaleCode(); err != nil || stale {
+		t.Fatalf("target-patched memory reported stale: %v %v", stale, err)
 	}
-	if !base.Equal(clone) || !base.Equal(base) {
-		t.Fatal("identical specs reported different")
+	m.memory[0x1010] = 0xCC // an old patch byte, neither stock nor target
+	if stale, err := p.StaleCode(); err != nil || !stale {
+		t.Fatalf("old patch byte not reported stale: %v %v", stale, err)
 	}
-	clone.LocalOnly.Offset = 0x1001
-	if base.Equal(clone) {
-		t.Fatal("offset change not detected")
-	}
-	clone.LocalOnly.Offset = 0x1000
-	clone.SingleUser.Code = []byte{0xB8, 0, 0, 0, 0}
-	if base.Equal(clone) {
-		t.Fatal("code change not detected")
-	}
-	clone.SingleUser.Code = []byte{0xB8, 1, 0, 0, 0}
-	clone.SLInitGlobals["bServerSku"] = 0x3008
-	if base.Equal(clone) {
-		t.Fatal("global address change not detected")
-	}
-	clone.SLInitGlobals["bServerSku"] = 0x3004
-	clone.LocalOnly = nil
-	if base.Equal(clone) {
-		t.Fatal("missing component not detected")
-	}
-	if !(*Spec)(nil).Equal(nil) {
-		t.Fatal("two nil specs should be equal")
-	}
-	if base.Equal(nil) || (*Spec)(nil).Equal(base) {
-		t.Fatal("nil vs non-nil specs should differ")
+	m.memory[0x1010] = 0xEB
+	m.memory[0x1020] = 0xCC // stale SingleUser site
+	if stale, err := p.StaleCode(); err != nil || !stale {
+		t.Fatalf("stale SingleUser site not detected: %v %v", stale, err)
 	}
 }

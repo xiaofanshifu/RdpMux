@@ -54,10 +54,16 @@ rdpmux.exe status
 
 `status` 可以显示 `termsrv.dll` 版本、补丁库日期、TermService 状态和监听状态。补丁是否真正生效需要读取 TermService 进程内存，因此该检查需要管理员权限；非管理员运行时会提示以管理员身份检查。
 
-更新补丁库：
+更新补丁库（仅从 GitHub 下载并写入，不会立即应用）：
 
 ```bat
 rdpmux.exe update
+```
+
+重启补丁服务以应用当前补丁库（更新后需执行此步或重启电脑才生效）：
+
+```bat
+rdpmux.exe restart
 ```
 
 立即应用一次补丁（不通过服务）：
@@ -70,12 +76,13 @@ rdpmux.exe patch
 
 ```bat
 rdpmux.exe uninstall
-rdpmux.exe uninstall -k   # 保留 RDP 设置
 ```
 
-卸载会重启 TermService，当前活动的 RDP 会话将断开。无法立即删除的自身程序或日志文件会安排在下次重启后删除。
+卸载会移除补丁服务并重启 TermService 以清除内存补丁（当前活动的 RDP 会话将断开），**远程桌面保持启用**，恢复原版单会话行为。无法立即删除的自身程序或日志文件会安排在下次重启后删除。若上次卸载中断、仍有残留，再次卸载会继续完成清理。
 
-图形界面的操作与命令行一致，安装、卸载、更新和重启 TermService 按钮位于主窗口中。语言下拉框会立即切换界面语言，尚未保存的设置和日志内容不会丢失。
+图形界面的操作与命令行一致，安装、卸载、更新 INI、重启服务和重启 TermService 按钮位于主窗口中；更新/重启类按钮与端口输入框带有悬浮提示。语言下拉框会立即切换界面语言，尚未保存的设置和日志内容不会丢失。
+
+RdpMux 不自动管理 Windows 防火墙规则；请自行确保防火墙放行 RDP 端口（GUI 端口输入框的悬浮提示亦有说明）。
 
 ## 运行要求
 
@@ -115,7 +122,7 @@ rdpmux.exe help -lang en-US
 ## 权限说明
 
 - `help`、`status`：以当前用户权限运行，不触发 UAC。
-- `install`、`uninstall`、`update`、`patch`：需要管理员权限，未提权时会通过 UAC 自动提权并等待结果。
+- `install`、`uninstall`、`update`、`restart`、`patch`：需要管理员权限，未提权时会通过 UAC 自动提权并等待结果。
 - `rdpmuxgui.exe`：始终以管理员权限运行，因为 GUI 的安装、卸载和状态检查都需要管理员权限。
 
 ## 配置
