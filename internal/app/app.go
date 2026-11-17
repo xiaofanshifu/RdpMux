@@ -76,6 +76,22 @@ func patchDBPath() string {
 	return winsvc.IniPath()
 }
 
+// readInstallPatchDB selects the database that install validates and deploys:
+// an existing installation's INI, then an INI next to the exe (where update
+// writes before the service exists), then the embedded fallback.
+func readInstallPatchDB(dirs ...string) ([]byte, error) {
+	for _, dir := range dirs {
+		data, err := os.ReadFile(filepath.Join(dir, "rdpwrap.ini"))
+		if err == nil {
+			return data, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+	return assets.ConfigINI, nil
+}
+
 var dbCache struct {
 	mu  sync.Mutex
 	key string
@@ -162,7 +178,7 @@ func copyFile(src, dst string) error {
 	return writeFileAtomic(dst, data)
 }
 
-func deployFiles(log *logx.Logger) (string, error) {
+func deployFiles(log *logx.Logger, iniData []byte) (string, error) {
 	dir := sysconfig.InstallDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
@@ -198,7 +214,7 @@ func deployFiles(log *logx.Logger) (string, error) {
 	}
 	iniPath := filepath.Join(dir, "rdpwrap.ini")
 	if _, err := os.Stat(iniPath); err != nil {
-		if err := writeFileAtomic(iniPath, assets.ConfigINI); err != nil {
+		if err := writeFileAtomic(iniPath, iniData); err != nil {
 			return "", err
 		}
 	}
@@ -259,7 +275,19 @@ func Install(log *logx.Logger) (err error) {
 	if err := checkPendingDeletion(sysconfig.InstallDir()); err != nil {
 		return err
 	}
-	exePath, err := deployFiles(log)
+	fv, err := winutil.GetFileVersion(winutil.ExpandSystemPath("System32", "termsrv.dll"))
+	if err != nil {
+		return err
+	}
+	data, err := readInstallPatchDB(sysconfig.InstallDir(), ExeDir())
+	if err != nil {
+		return err
+	}
+	db, err := checkPatchDB(data, fv.String())
+	if err != nil {
+		return err
+	}
+	exePath, err := deployFiles(log, data)
 	if err != nil {
 		return err
 	}
@@ -270,6 +298,7 @@ func Install(log *logx.Logger) (err error) {
 	var undo func() error
 	var restoreStart func() error
 	termStarted := false
+	patchServiceStarted := false
 	defer func() {
 		if err == nil {
 			return
@@ -277,6 +306,11 @@ func Install(log *logx.Logger) (err error) {
 		err = errors.Join(err, winsvc.Remove())
 		if termStarted {
 			err = errors.Join(err, winutil.SvcStop("TermService"))
+		} else if patchServiceStarted {
+			// TermService was already running and the patch service may have
+			// patched its memory; restart it so a failed install does not
+			// leave patches active after reporting failure.
+			err = errors.Join(err, sysconfig.RestartTermService())
 		}
 		if restoreStart != nil {
 			err = errors.Join(err, restoreStart())
@@ -313,8 +347,12 @@ func Install(log *logx.Logger) (err error) {
 	if err = winsvc.Start(); err != nil {
 		return err
 	}
+	patchServiceStarted = true
 	if dropErr := sysconfig.DropRfxvmt(); dropErr != nil {
 		log.Warn("%s", tr("LogRfxvmtWarn", "could not write rfxvmt.dll: %s", dropErr))
+	}
+	if err = verifyServicePatches(db, log); err != nil {
+		return err
 	}
 	log.Info("%s", tr("LogInstalled", "installed; the service maintains concurrent sessions"))
 	return nil
@@ -326,6 +364,12 @@ func Uninstall(keep bool, log *logx.Logger) error {
 		return err
 	}
 	defer unlock()
+	if _, stateErr := winsvc.State(); stateErr != nil {
+		if errors.Is(stateErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return fmt.Errorf("%s", tr("SvcNotInstalled", "service %s is not installed", winsvc.Name))
+		}
+		return stateErr
+	}
 	log.Info("%s", tr("LogRemovingService", "removing patch service..."))
 	if err := winsvc.Remove(); err != nil {
 		return err
@@ -364,6 +408,82 @@ func Uninstall(keep bool, log *logx.Logger) error {
 	return nil
 }
 
+func checkPatchDB(data []byte, version string) (*patcher.DB, error) {
+	db, err := patcher.LoadDB(data, sysconfig.Arch())
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := db.Spec(version); !ok {
+		if reason := db.Invalid[version]; reason != nil {
+			return nil, fmt.Errorf("%s", tr("ErrInvalidVersionPatch", "termsrv %s has invalid patch data: %s", version, reason))
+		}
+		return nil, fmt.Errorf("%s", tr("ErrUnsupportedVersion", "patch database %s does not support termsrv %s; update to a database that includes this exact version", db.Updated, version))
+	}
+	return db, nil
+}
+
+func waitForPatch(ctx context.Context, verify func() (bool, error)) error {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%s: %w", tr("ErrPatchNotActive", "patch service did not activate all patches"), err)
+		}
+		active, err := verify()
+		if err != nil {
+			return err
+		}
+		if active {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
+		}
+	}
+}
+
+func verifyServicePatches(db *patcher.DB, log *logx.Logger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := waitForPatch(ctx, func() (bool, error) {
+		state, pid, err := sysconfig.TermServiceState()
+		if err != nil {
+			return false, err
+		}
+		if state != uint32(svc.Running) || pid == 0 {
+			return false, fmt.Errorf("TermService is not running")
+		}
+		p, err := patcher.New(pid, db, sysconfig.Arch(), nil)
+		if err != nil {
+			return false, err
+		}
+		defer p.Close()
+		return p.Verify()
+	}); err != nil {
+		return err
+	}
+	log.Info("%s", loc.L("Patcher", "Verified", "verified: all patches active"))
+	return nil
+}
+
+// termServiceRestartNeeded reports whether the patch spec for the running
+// termsrv version changed between the old and new database. Already-applied
+// bytes cannot be replaced in place, so a changed spec requires restarting
+// TermService; an unchanged spec (e.g. only new versions added) does not.
+func termServiceRestartNeeded(oldContent []byte, newDB *patcher.DB, version, arch string) bool {
+	oldDB, err := patcher.LoadDB(oldContent, arch)
+	if err != nil {
+		return false
+	}
+	oldSpec, ok := oldDB.Spec(version)
+	if !ok {
+		return false
+	}
+	newSpec, _ := newDB.Spec(version)
+	return !oldSpec.Equal(newSpec)
+}
+
 func Update(source string, log *logx.Logger) error {
 	unlock, err := beginOperation()
 	if err != nil {
@@ -383,7 +503,11 @@ func Update(source string, log *logx.Logger) error {
 	if err != nil {
 		return err
 	}
-	db, err := patcher.LoadDB([]byte(content), sysconfig.Arch())
+	fv, err := winutil.GetFileVersion(winutil.ExpandSystemPath("System32", "termsrv.dll"))
+	if err != nil {
+		return err
+	}
+	db, err := checkPatchDB([]byte(content), fv.String())
 	if err != nil {
 		return fmt.Errorf("%s", tr("ErrDownloadedINIInvalid", "downloaded ini invalid: %s", err))
 	}
@@ -399,15 +523,24 @@ func Update(source string, log *logx.Logger) error {
 	oldDate, _ := patcher.INIDate(string(old))
 	if bytes.Equal(old, []byte(content)) {
 		log.Info("%s", tr("LogAlreadyUpToDate", "already up to date (%d)", newDate))
-		return nil
+	} else {
+		if err := writeFileAtomic(iniPath, []byte(content)); err != nil {
+			return err
+		}
+		log.Info("%s", tr("LogDBUpdated", "patch database updated (%d -> %d)", oldDate, newDate))
 	}
-	if err := writeFileAtomic(iniPath, []byte(content)); err != nil {
-		return err
-	}
-	log.Info("%s", tr("LogDBUpdated", "patch database updated (%d -> %d)", oldDate, newDate))
 	if st, err := winsvc.State(); err == nil && st == svc.Running {
+		if termServiceRestartNeeded(old, db, fv.String(), sysconfig.Arch()) {
+			log.Info("%s", tr("LogUpdateRestartingTermService", "patch data for termsrv %s changed; restarting TermService to clear old patches (active RDP sessions will disconnect)...", fv.String()))
+			if err := sysconfig.RestartTermService(); err != nil {
+				return err
+			}
+		}
 		log.Info("%s", tr("LogRestartingPatchService", "restarting patch service..."))
 		if err := winsvc.Restart(); err != nil {
+			return err
+		}
+		if err := verifyServicePatches(db, log); err != nil {
 			return err
 		}
 	}

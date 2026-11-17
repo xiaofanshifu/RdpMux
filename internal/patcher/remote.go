@@ -30,7 +30,11 @@ func OpenProcess(pid uint32) (*Process, error) {
 		windows.CloseHandle(h)
 		return nil, err
 	}
-	mutex, err := windows.CreateMutex(nil, false, name)
+	// Request only the rights Lock/Unlock need. CreateMutex would open an
+	// existing mutex with MUTEX_ALL_ACCESS, which a service-created (SYSTEM)
+	// mutex may deny to an administrator; CreateMutexEx avoids that, matching
+	// the log rotation mutex.
+	mutex, err := windows.CreateMutexEx(nil, name, 0, windows.SYNCHRONIZE|windows.MUTEX_MODIFY_STATE)
 	if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
 		windows.CloseHandle(h)
 		return nil, err

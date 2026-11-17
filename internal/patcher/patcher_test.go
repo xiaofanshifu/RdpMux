@@ -6,7 +6,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
+
+	"rdpmux/internal/assets"
+	"rdpmux/internal/winutil"
 )
 
 type mockProcess struct {
@@ -215,6 +219,48 @@ func TestDiskBytesRejectsVirtualTailAndCrossSection(t *testing.T) {
 	}
 }
 
+func TestSelectedTermsrvImage(t *testing.T) {
+	path := os.Getenv("RDPMUX_TEST_TERMSRV")
+	if path == "" {
+		t.Skip("RDPMUX_TEST_TERMSRV is not set")
+	}
+	fv, err := winutil.GetFileVersion(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := LoadDB(assets.ConfigINI, "x64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, ok := db.Spec(fv.String())
+	if !ok {
+		t.Fatalf("unsupported image %s", fv.String())
+	}
+	disk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image, err := pe.NewFile(bytes.NewReader(disk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer image.Close()
+	p := &Patcher{spec: spec, db: db, disk: disk, peFile: image}
+	if err := p.validateTargets(); err != nil {
+		t.Fatal(err)
+	}
+	for _, cp := range []*CodePatch{spec.LocalOnly, spec.SingleUser, spec.DefPolicy} {
+		if cp == nil {
+			continue
+		}
+		before, err := p.diskBytes(cp.Offset, len(cp.Code))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%s %s RVA=0x%X before=% X", fv.String(), cp.Name, cp.Offset, before)
+	}
+}
+
 func TestValidateTargetsRejectsOverlapAndExecutableGlobals(t *testing.T) {
 	p, _ := testPatcher()
 	p.spec.SingleUser.Offset = p.spec.LocalOnly.Offset
@@ -225,5 +271,46 @@ func TestValidateTargetsRejectsOverlapAndExecutableGlobals(t *testing.T) {
 	p.spec.SLInitGlobals = map[string]uint32{"bInitialized": 0x1040}
 	if err := p.validateTargets(); err == nil {
 		t.Fatal("accepted executable global")
+	}
+}
+
+func TestSpecEqual(t *testing.T) {
+	base := &Spec{
+		LocalOnly:     &CodePatch{Name: "LocalOnly", Offset: 0x1000, Code: []byte{0xEB}},
+		SingleUser:    &CodePatch{Name: "SingleUser", Offset: 0x2000, Code: []byte{0xB8, 1, 0, 0, 0}},
+		SLInitGlobals: map[string]uint32{"bInitialized": 0x3000, "bServerSku": 0x3004},
+	}
+	clone := &Spec{
+		LocalOnly:     &CodePatch{Name: "LocalOnly", Offset: 0x1000, Code: []byte{0xEB}},
+		SingleUser:    &CodePatch{Name: "SingleUser", Offset: 0x2000, Code: []byte{0xB8, 1, 0, 0, 0}},
+		SLInitGlobals: map[string]uint32{"bInitialized": 0x3000, "bServerSku": 0x3004},
+	}
+	if !base.Equal(clone) || !base.Equal(base) {
+		t.Fatal("identical specs reported different")
+	}
+	clone.LocalOnly.Offset = 0x1001
+	if base.Equal(clone) {
+		t.Fatal("offset change not detected")
+	}
+	clone.LocalOnly.Offset = 0x1000
+	clone.SingleUser.Code = []byte{0xB8, 0, 0, 0, 0}
+	if base.Equal(clone) {
+		t.Fatal("code change not detected")
+	}
+	clone.SingleUser.Code = []byte{0xB8, 1, 0, 0, 0}
+	clone.SLInitGlobals["bServerSku"] = 0x3008
+	if base.Equal(clone) {
+		t.Fatal("global address change not detected")
+	}
+	clone.SLInitGlobals["bServerSku"] = 0x3004
+	clone.LocalOnly = nil
+	if base.Equal(clone) {
+		t.Fatal("missing component not detected")
+	}
+	if !(*Spec)(nil).Equal(nil) {
+		t.Fatal("two nil specs should be equal")
+	}
+	if base.Equal(nil) || (*Spec)(nil).Equal(base) {
+		t.Fatal("nil vs non-nil specs should differ")
 	}
 }

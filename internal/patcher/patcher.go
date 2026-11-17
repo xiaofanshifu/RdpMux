@@ -358,3 +358,38 @@ func (p *Patcher) Verify() (bool, error) {
 	log.Trace("%s", tr("VerifyOK", "verify: all patches active"))
 	return true, nil
 }
+
+// Equal reports whether two specs describe identical patches (offsets, code
+// bytes and SLInit global addresses). An updated database that changes the
+// spec for the running termsrv version requires restarting TermService, since
+// already-applied bytes cannot be replaced in place.
+func (s *Spec) Equal(other *Spec) bool {
+	if s == nil || other == nil {
+		return s == other
+	}
+	for _, pair := range [][2]*CodePatch{
+		{s.LocalOnly, other.LocalOnly},
+		{s.SingleUser, other.SingleUser},
+		{s.DefPolicy, other.DefPolicy},
+	} {
+		a, b := pair[0], pair[1]
+		if a == nil || b == nil {
+			if a != b {
+				return false
+			}
+			continue
+		}
+		if a.Offset != b.Offset || !bytes.Equal(a.Code, b.Code) {
+			return false
+		}
+	}
+	if len(s.SLInitGlobals) != len(other.SLInitGlobals) {
+		return false
+	}
+	for name, rva := range s.SLInitGlobals {
+		if otherRVA, ok := other.SLInitGlobals[name]; !ok || otherRVA != rva {
+			return false
+		}
+	}
+	return true
+}

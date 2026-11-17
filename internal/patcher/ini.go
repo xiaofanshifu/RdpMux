@@ -182,8 +182,14 @@ func LoadDB(data []byte, arch string) (*DB, error) {
 	}
 
 	buildCodePatch := func(sec map[string]string, prefix string) (*CodePatch, error) {
-		if sec[prefix+"Patch."+arch] != "1" {
+		switch sec[prefix+"Patch."+arch] {
+		case "1":
+		case "0":
 			return nil, nil
+		case "":
+			return nil, fmt.Errorf("missing %sPatch.%s switch", prefix, arch)
+		default:
+			return nil, fmt.Errorf("invalid %sPatch.%s value %q", prefix, arch, sec[prefix+"Patch."+arch])
 		}
 		offset, err := parseHexU32(sec[prefix+"Offset."+arch])
 		if err != nil {
@@ -194,6 +200,17 @@ func LoadDB(data []byte, arch string) (*DB, error) {
 			return nil, fmt.Errorf("%sCode: unknown patch code %q", prefix, sec[prefix+"Code."+arch])
 		}
 		return &CodePatch{Name: prefix, Offset: offset, Code: code}, nil
+	}
+
+	// A section is a patch entry for this architecture only if it carries any
+	// arch-specific patch data; x86-only entries are skipped, not rejected.
+	hasArchPatchData := func(sec map[string]string) bool {
+		for _, prefix := range []string{"LocalOnly", "SingleUser", "DefPolicy"} {
+			if sec[prefix+"Patch."+arch] != "" || sec[prefix+"Offset."+arch] != "" || sec[prefix+"Code."+arch] != "" {
+				return true
+			}
+		}
+		return sec["SLInitHook."+arch] != "" || sec["SLInitOffset."+arch] != ""
 	}
 
 versions:
@@ -216,6 +233,9 @@ versions:
 		if sec["SLPolicyInternal."+arch] == "1" {
 			continue
 		}
+		if !hasArchPatchData(sec) {
+			continue
+		}
 		spec := &Spec{}
 		var err error
 		if spec.LocalOnly, err = buildCodePatch(sec, "LocalOnly"); err != nil {
@@ -228,6 +248,16 @@ versions:
 		}
 		if spec.DefPolicy, err = buildCodePatch(sec, "DefPolicy"); err != nil {
 			db.Invalid[name] = err
+			continue versions
+		}
+		switch sec["SLInitHook."+arch] {
+		case "", "0", "1":
+		default:
+			db.Invalid[name] = fmt.Errorf("invalid SLInitHook.%s value %q", arch, sec["SLInitHook."+arch])
+			continue versions
+		}
+		if sec["SLInitHook."+arch] == "" {
+			db.Invalid[name] = fmt.Errorf("missing SLInitHook.%s switch", arch)
 			continue versions
 		}
 		if sec["SLInitHook."+arch] == "1" {
