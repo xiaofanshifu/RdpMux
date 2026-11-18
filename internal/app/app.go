@@ -825,6 +825,7 @@ type Status struct {
 	PatchNeedAdmin   bool
 	PatchErr         error
 	Listener         bool
+	ListenerPort     uint32
 	ServiceState     svc.State
 	ServiceInstalled bool
 }
@@ -857,7 +858,8 @@ func GetStatus() Status {
 			p.Close()
 		}
 	}
-	s.Listener = sysconfig.ListenerReady(sysconfig.ListenerPort())
+	s.ListenerPort = sysconfig.ListenerPort()
+	s.Listener = sysconfig.ListenerReady(s.ListenerPort)
 	if st, err := winsvc.State(); err == nil {
 		s.ServiceInstalled = true
 		s.ServiceState = st

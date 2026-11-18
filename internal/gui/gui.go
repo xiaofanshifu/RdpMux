@@ -13,6 +13,7 @@ import (
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
 	"github.com/lxn/win"
+	"golang.org/x/sys/windows/svc"
 
 	"rdpmux/internal/app"
 	"rdpmux/internal/loc"
@@ -27,14 +28,16 @@ type ui struct {
 	footer      *walk.Composite
 	lsPatch     *walk.Label
 	lsService   *walk.Label
+	lsSvc       *walk.Label
 	lsListener  *walk.Label
 	lsTSVer     *walk.Label
 	lsSupport   *walk.Label
 	lsDB        *walk.Label
-	dotService  *walk.Label
-	dotPatch    *walk.Label
-	dotListener *walk.Label
-	dotVersion  *walk.Label
+	dotService  *colorDot
+	dotSvc      *colorDot
+	dotPatch    *colorDot
+	dotListener *colorDot
+	dotVersion  *colorDot
 	cbAllow     *walk.CheckBox
 	cbSingle    *walk.CheckBox
 	cbHide      *walk.CheckBox
@@ -85,7 +88,15 @@ type settingsView interface {
 type walkSettings struct{ u *ui }
 
 func newUI() *ui {
-	u := &ui{stopCh: make(chan struct{}), backend: systemBackend{}}
+	u := &ui{
+		stopCh:      make(chan struct{}),
+		backend:     systemBackend{},
+		dotService:  newColorDot(),
+		dotSvc:      newColorDot(),
+		dotPatch:    newColorDot(),
+		dotListener: newColorDot(),
+		dotVersion:  newColorDot(),
+	}
 	u.enqueue = func(f func()) { u.mw.Synchronize(f) }
 	u.settings = walkSettings{u}
 	return u
@@ -122,9 +133,45 @@ var (
 	colorMuted = walk.RGB(0x60, 0x60, 0x60)
 )
 
-func setDot(label *walk.Label, color walk.Color) {
-	if label != nil {
-		label.SetTextColor(color)
+// Status dots are custom-painted squares. Labels cannot be relied on here:
+// their text color only takes effect through WM_CTLCOLORSTATIC.
+var dotBrushes = map[walk.Color]walk.Brush{}
+
+func setDot(dot *colorDot, color walk.Color) { dot.set(color) }
+
+type colorDot struct {
+	widget *walk.CustomWidget
+	color  walk.Color
+}
+
+func newColorDot() *colorDot { return &colorDot{color: colorIdle} }
+
+func (d *colorDot) paint(canvas *walk.Canvas, _ walk.Rectangle) error {
+	brush, ok := dotBrushes[d.color]
+	if !ok {
+		var err error
+		if brush, err = walk.NewSolidColorBrush(d.color); err != nil {
+			return err
+		}
+		dotBrushes[d.color] = brush
+	}
+	// The layout stretches the widget vertically, so draw a centered square
+	// instead of a tall bar.
+	bounds := d.widget.ClientBounds()
+	size := min(bounds.Width, bounds.Height)
+	bounds.X += (bounds.Width - size) / 2
+	bounds.Y += (bounds.Height - size) / 2
+	bounds.Width, bounds.Height = size, size
+	return canvas.FillRectangle(brush, bounds)
+}
+
+func (d *colorDot) set(color walk.Color) {
+	if d == nil || d.color == color {
+		return
+	}
+	d.color = color
+	if d.widget != nil {
+		d.widget.Invalidate()
 	}
 }
 
@@ -248,16 +295,22 @@ func (u *ui) statusStrip() Widget {
 		Layout:  HBox{Spacing: 28, MarginsZero: true, Alignment: AlignHNearVNear},
 		MaxSize: Size{Width: 32767},
 		Children: []Widget{
-			statusItem(mf("sbService.Caption", "Service"), &u.dotService, &u.lsService),
-			statusItem(mf("sbPatch.Caption", "Patch"), &u.dotPatch, &u.lsPatch),
-			statusItem(mf("sbListener.Caption", "Listener"), &u.dotListener, &u.lsListener),
-			statusItem(mf("lTSVer.Caption", "termsrv ver."), &u.dotVersion, &u.lsTSVer, &u.lsSupport),
+			statusItem(mf("sbService.Caption", "TermService"), u.dotService, &u.lsService),
+			statusItem(mf("sbPatchService.Caption", "Patch service"), u.dotSvc, &u.lsSvc),
+			statusItem(mf("sbPatch.Caption", "Patch"), u.dotPatch, &u.lsPatch),
+			statusItem(mf("sbListener.Caption", "RDP listener"), u.dotListener, &u.lsListener),
+			statusItem(mf("lTSVer.Caption", "termsrv ver."), u.dotVersion, &u.lsTSVer, &u.lsSupport),
 		},
 	}
 }
 
-func statusItem(caption string, dot **walk.Label, values ...**walk.Label) Widget {
-	row := []Widget{Label{AssignTo: dot, Text: "●", TextColor: colorIdle}}
+func statusItem(caption string, dot *colorDot, values ...**walk.Label) Widget {
+	row := []Widget{CustomWidget{
+		AssignTo: &dot.widget,
+		MinSize:  Size{Width: 10, Height: 10},
+		MaxSize:  Size{Width: 10, Height: 10},
+		Paint:    dot.paint,
+	}}
 	for i, v := range values {
 		text := ""
 		if i == 0 {
@@ -269,7 +322,7 @@ func statusItem(caption string, dot **walk.Label, values ...**walk.Label) Widget
 		Layout: VBox{Spacing: 2, MarginsZero: true, Alignment: AlignHNearVNear},
 		Children: []Widget{
 			Label{Text: caption, TextColor: colorMuted},
-			Composite{Layout: HBox{Spacing: 6, MarginsZero: true, Alignment: AlignHNearVNear}, Children: row},
+			Composite{Layout: HBox{Spacing: 6, MarginsZero: true, Alignment: AlignHNearVCenter}, Children: row},
 		},
 	}
 }
@@ -824,11 +877,26 @@ func (u *ui) applyStatus(s app.Status) {
 		u.lsPatch.SetText(st("NotPatched", "inactive"))
 	}
 	setDot(u.dotPatch, patchColor)
+	svcColor := colorIdle
+	switch {
+	case !s.ServiceInstalled:
+		u.lsSvc.SetText(st("NotInstalled", "Not installed"))
+	case s.ServiceState == svc.Running:
+		u.lsSvc.SetText(termStateText(uint32(s.ServiceState)))
+		svcColor = colorOK
+	case s.ServiceState == svc.Stopped:
+		u.lsSvc.SetText(termStateText(uint32(s.ServiceState)))
+		svcColor = colorBad
+	default:
+		u.lsSvc.SetText(termStateText(uint32(s.ServiceState)))
+	}
+	setDot(u.dotSvc, svcColor)
+	port := fmt.Sprintf(" (%d)", s.ListenerPort)
 	if s.Listener {
-		u.lsListener.SetText(st("Listening", "Listening"))
+		u.lsListener.SetText(st("Listening", "Listening") + port)
 		setDot(u.dotListener, colorOK)
 	} else {
-		u.lsListener.SetText(st("NotListening", "Not listening"))
+		u.lsListener.SetText(st("NotListening", "Not listening") + port)
 		setDot(u.dotListener, colorBad)
 	}
 }
