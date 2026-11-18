@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -183,32 +184,20 @@ func deployFiles(log *logx.Logger, iniData []byte) (string, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
-	exe, err := os.Executable()
+	cliSrc, guiSrc, err := sourceBinaries()
 	if err != nil {
 		return "", err
-	}
-	exe, err = filepath.EvalSymlinks(exe)
-	if err != nil {
-		return "", err
-	}
-	exeDir := filepath.Dir(exe)
-	cliSrc := filepath.Join(exeDir, "rdpmux.exe")
-	if strings.EqualFold(filepath.Base(exe), "rdpmux.exe") {
-		cliSrc = exe
-	} else if _, err := os.Stat(cliSrc); err != nil {
-		return "", fmt.Errorf("%s", tr("ErrCliNotFound", "rdpmux.exe not found next to %s", filepath.Base(exe)))
 	}
 	target := filepath.Join(dir, "rdpmux.exe")
 	if !strings.EqualFold(cliSrc, target) {
 		if err := copyFile(cliSrc, target); err != nil {
-			return "", err
+			return "", fmt.Errorf("deploy %s: %w", filepath.Base(target), err)
 		}
 	}
-	guiSrc := filepath.Join(exeDir, "rdpmuxgui.exe")
-	if _, err := os.Stat(guiSrc); err == nil {
+	if guiSrc != "" {
 		if guiTarget := filepath.Join(dir, "rdpmuxgui.exe"); !strings.EqualFold(guiSrc, guiTarget) {
 			if err := copyFile(guiSrc, guiTarget); err != nil {
-				return "", err
+				return "", fmt.Errorf("deploy %s: %w", filepath.Base(guiTarget), err)
 			}
 		}
 	}
@@ -227,6 +216,90 @@ func deployFiles(log *logx.Logger, iniData []byte) (string, error) {
 	}
 	log.Info("%s", tr("LogFilesDeployed", "files deployed to %s", dir))
 	return target, nil
+}
+
+// sourceBinaries returns the CLI and GUI binaries that deployFiles copies into
+// the installation directory: the CLI of the running executable and the GUI
+// next to it, when present.
+func sourceBinaries() (cli, gui string, err error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", "", err
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return "", "", err
+	}
+	dir := filepath.Dir(exe)
+	cli = filepath.Join(dir, "rdpmux.exe")
+	if strings.EqualFold(filepath.Base(exe), "rdpmux.exe") {
+		cli = exe
+	} else if _, statErr := os.Stat(cli); statErr != nil {
+		return "", "", fmt.Errorf("%s", tr("ErrCliNotFound", "rdpmux.exe not found next to %s", filepath.Base(exe)))
+	}
+	gui = filepath.Join(dir, "rdpmuxgui.exe")
+	if _, statErr := os.Stat(gui); statErr != nil {
+		gui = ""
+	}
+	return cli, gui, nil
+}
+
+// sameBinaries reports whether dir already holds the binaries this executable
+// would deploy, so repeating install does not rewrite identical files.
+func sameBinaries(dir string) (bool, error) {
+	cli, gui, err := sourceBinaries()
+	if err != nil {
+		return false, err
+	}
+	for _, src := range []string{cli, gui} {
+		if src == "" {
+			continue
+		}
+		dst := filepath.Join(dir, filepath.Base(src))
+		if strings.EqualFold(src, dst) {
+			continue
+		}
+		same, hashErr := sameContent(src, dst)
+		if hashErr != nil || !same {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func sameContent(a, b string) (bool, error) {
+	ha, err := fileSHA256(a)
+	if err != nil {
+		return false, err
+	}
+	hb, err := fileSHA256(b)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(ha, hb), nil
+}
+
+func fileSHA256(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
+}
+
+// startInstalledService makes sure an up-to-date installation is running.
+func startInstalledService(log *logx.Logger) error {
+	state, err := winsvc.State()
+	if err != nil || state == svc.Running {
+		return err
+	}
+	log.Info("%s", tr("LogStartingService", "starting the patch service..."))
+	return winsvc.Start()
 }
 
 func pendingDeletion(entries []string, dir string) bool {
@@ -267,10 +340,25 @@ func Install(log *logx.Logger) (err error) {
 		return err
 	}
 	defer unlock()
+	// Install is idempotent: on an existing installation it redeploys the
+	// binaries of this build and updates the service registration, keeping the
+	// deployed rdpwrap.ini and rdpmux.conf. RDP settings are only touched when
+	// the service does not exist yet.
+	installed := false
 	if _, stateErr := winsvc.State(); stateErr == nil {
-		return fmt.Errorf("%s", tr("SvcAlreadyInstalled", "service %s already installed", winsvc.Name))
+		installed = true
 	} else if !errors.Is(stateErr, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		return stateErr
+	}
+	if installed {
+		current, cmpErr := sameBinaries(sysconfig.InstallDir())
+		if cmpErr != nil {
+			return cmpErr
+		}
+		if current {
+			log.Info("%s", tr("LogAlreadyCurrent", "already installed with this build; nothing to deploy"))
+			return startInstalledService(log)
+		}
 	}
 	if err := checkPendingDeletion(sysconfig.InstallDir()); err != nil {
 		return err
@@ -287,14 +375,6 @@ func Install(log *logx.Logger) (err error) {
 	if err != nil {
 		return err
 	}
-	exePath, err := deployFiles(log, data)
-	if err != nil {
-		return err
-	}
-	log.Info("%s", tr("LogInstallingService", "installing patch service..."))
-	if err = winsvc.Install(exePath); err != nil {
-		return err
-	}
 	var undo func() error
 	var restoreStart func() error
 	termStarted := false
@@ -303,14 +383,20 @@ func Install(log *logx.Logger) (err error) {
 		if err == nil {
 			return
 		}
-		err = errors.Join(err, winsvc.Remove())
-		if termStarted {
-			err = errors.Join(err, winutil.SvcStop("TermService"))
-		} else if patchServiceStarted {
-			// TermService was already running and the patch service may have
-			// patched its memory; restart it so a failed install does not
-			// leave patches active after reporting failure.
-			err = errors.Join(err, sysconfig.RestartTermService(log))
+		if installed {
+			// A service that existed before this run must survive a failed
+			// redeploy, so bring it back instead of deleting its record.
+			err = errors.Join(err, winsvc.Start())
+		} else {
+			err = errors.Join(err, winsvc.Remove())
+			if termStarted {
+				err = errors.Join(err, winutil.SvcStop("TermService"))
+			} else if patchServiceStarted {
+				// TermService was already running and the patch service may
+				// have patched its memory; restart it so a failed install does
+				// not leave patches active after reporting failure.
+				err = errors.Join(err, sysconfig.RestartTermService(log))
+			}
 		}
 		if restoreStart != nil {
 			err = errors.Join(err, restoreStart())
@@ -319,33 +405,50 @@ func Install(log *logx.Logger) (err error) {
 			err = errors.Join(err, undo())
 		}
 	}()
-	log.Info("%s", tr("LogEnablingRDP", "enabling Remote Desktop..."))
-	undo, err = sysconfig.EnableRDP()
-	if err != nil {
-		return err
-	}
-	state, _, err := sysconfig.TermServiceState()
-	if err != nil {
-		return err
-	}
-	if state != uint32(svc.Running) {
-		start, startErr := winutil.SvcGetStart("TermService")
-		if startErr != nil {
-			return startErr
-		}
-		if start == windows.SERVICE_DISABLED {
-			if err = winutil.SvcSetStart("TermService", windows.SERVICE_AUTO_START); err != nil {
-				return err
-			}
-			restoreStart = func() error { return winutil.SvcSetStart("TermService", start) }
-		}
-		if err = winutil.SvcStart("TermService"); err != nil {
+	if installed {
+		log.Info("%s", tr("LogRedeploy", "already installed; deploying this build over the program files (rdpwrap.ini and rdpmux.conf are kept)..."))
+		// The service keeps its own binary open, so it must stop first.
+		if err = winsvc.Stop(); err != nil {
 			return err
 		}
-		termStarted = true
 	}
-	if err = ensureRDPListener(log, termStarted); err != nil {
+	exePath, err := deployFiles(log, data)
+	if err != nil {
 		return err
+	}
+	log.Info("%s", tr("LogInstallingService", "installing patch service..."))
+	if err = winsvc.Install(exePath); err != nil {
+		return err
+	}
+	if !installed {
+		log.Info("%s", tr("LogEnablingRDP", "enabling Remote Desktop..."))
+		undo, err = sysconfig.EnableRDP()
+		if err != nil {
+			return err
+		}
+		state, _, stateErr := sysconfig.TermServiceState()
+		if stateErr != nil {
+			return stateErr
+		}
+		if state != uint32(svc.Running) {
+			start, startErr := winutil.SvcGetStart("TermService")
+			if startErr != nil {
+				return startErr
+			}
+			if start == windows.SERVICE_DISABLED {
+				if err = winutil.SvcSetStart("TermService", windows.SERVICE_AUTO_START); err != nil {
+					return err
+				}
+				restoreStart = func() error { return winutil.SvcSetStart("TermService", start) }
+			}
+			if err = winutil.SvcStart("TermService"); err != nil {
+				return err
+			}
+			termStarted = true
+		}
+		if err = ensureRDPListener(log, termStarted); err != nil {
+			return err
+		}
 	}
 	if err = winsvc.Start(); err != nil {
 		return err
@@ -354,8 +457,17 @@ func Install(log *logx.Logger) (err error) {
 	if dropErr := sysconfig.DropRfxvmt(); dropErr != nil {
 		log.Warn("%s", tr("LogRfxvmtWarn", "could not write rfxvmt.dll: %s", dropErr))
 	}
-	if err = verifyServicePatches(db, log); err != nil {
-		return err
+	verify := true
+	if installed {
+		if state, _, stateErr := sysconfig.TermServiceState(); stateErr == nil && state != uint32(svc.Running) {
+			log.Warn("%s", tr("LogVerifySkipped", "TermService is not running; patch verification skipped"))
+			verify = false
+		}
+	}
+	if verify {
+		if err = verifyServicePatches(db, log); err != nil {
+			return err
+		}
 	}
 	log.Info("%s", tr("LogInstalled", "installed; the service maintains concurrent sessions"))
 	return nil

@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 
-	"rdpmux/internal/loc"
 	"rdpmux/internal/patcher"
 	"rdpmux/internal/winutil"
 )
@@ -19,25 +19,30 @@ import (
 const Name = "RdpMux"
 const DisplayName = "RdpMux RDP Patch Service"
 
+// Install registers the service, or updates the registration in place when it
+// already exists, so installing again repairs the installation instead of
+// failing. The caller stops the service before replacing its binary.
 func Install(exePath string) error {
 	m, err := mgr.Connect()
 	if err != nil {
 		return err
 	}
 	defer m.Disconnect()
+	cfg := mgr.Config{
+		ServiceType:    windows.SERVICE_WIN32_OWN_PROCESS,
+		StartType:      mgr.StartAutomatic,
+		ErrorControl:   mgr.ErrorNormal,
+		DisplayName:    DisplayName,
+		Description:    "Maintains concurrent RDP session patches for termsrv.dll (RdpMux).",
+		BinaryPathName: syscall.EscapeArg(exePath) + " service",
+	}
 	if s, err := m.OpenService(Name); err == nil {
-		s.Close()
-		return fmt.Errorf("%s", loc.LF("Installer", "SvcAlreadyInstalled", "service %s already installed", Name))
+		defer s.Close()
+		return s.UpdateConfig(cfg)
 	} else if !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		return err
 	}
-	s, err := m.CreateService(Name, exePath, mgr.Config{
-		ServiceType:  windows.SERVICE_WIN32_OWN_PROCESS,
-		StartType:    mgr.StartAutomatic,
-		ErrorControl: mgr.ErrorNormal,
-		DisplayName:  DisplayName,
-		Description:  "Maintains concurrent RDP session patches for termsrv.dll (RdpMux).",
-	}, "service")
+	s, err := m.CreateService(Name, exePath, cfg, "service")
 	if err != nil {
 		return err
 	}

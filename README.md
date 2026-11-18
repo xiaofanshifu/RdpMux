@@ -79,6 +79,8 @@ rdpmux.exe uninstall
 
 卸载会移除补丁服务并重启 TermService 以清除内存补丁（当前活动的 RDP 会话将断开），**远程桌面保持启用**，恢复原版单会话行为——这里恢复的是 `termsrv.dll` 的内存补丁；安装时写入的 `EnableConcurrentSessions`、`AllowMultipleTSSessions`、`Terminal Server\AddIns` 及 `CertPropSvc`/`SessionEnv` 启动类型不会回滚（这些值在客户端版本上基本不参与会话限制）。无法立即删除的自身程序或日志文件会安排在下次重启后删除。若上次卸载中断、仍有残留，再次卸载会继续完成清理。
 
+安装是幂等的：未安装时执行完整安装；已安装且程序文件与当前构建一致时只确保服务在运行；不一致时先停补丁服务，用当前程序目录中的 `rdpmux.exe`/`rdpmuxgui.exe` 覆盖安装目录、更新服务注册后重新启动，`rdpwrap.ini` 与 `rdpmux.conf` 保留。重装不会改动远程桌面设置，也不会重启 TermService。
+
 安装、卸载、重启服务与重启 TermService 都由一个临时服务在会话外执行（SYSTEM，完成后自动删除），客户端只负责提交操作并显示日志。因此即使在 RDP 会话内操作、会话被 TermService 断开，操作本身仍会继续完成，重连后即可使用；日志会记录完整过程与结果。
 
 旧版本可能留下 `RdpMux TCP/UDP` 防火墙规则。新版不创建也不删除防火墙规则，因为无法可靠判断这些规则是否是唯一放行 RDP 端口的入站规则，删除后可能切断远程访问；如需清理，请自行执行 `netsh advfirewall firewall delete rule name="RdpMux TCP"` 与 `name="RdpMux UDP"`。
