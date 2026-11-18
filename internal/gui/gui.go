@@ -2,6 +2,7 @@ package gui
 
 import (
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"sync"
@@ -55,6 +56,7 @@ type ui struct {
 type guiBackend interface {
 	Status() app.Status
 	WriteSettings(sysconfig.Settings) error
+	RunOperation(op string, display io.Writer) error
 }
 
 type systemBackend struct{}
@@ -62,6 +64,9 @@ type systemBackend struct{}
 func (systemBackend) Status() app.Status { return app.GetStatus() }
 func (systemBackend) WriteSettings(s sysconfig.Settings) error {
 	return sysconfig.WriteSettings(s)
+}
+func (systemBackend) RunOperation(op string, display io.Writer) error {
+	return app.RunOperation(op, logx.ResolveLevel("", app.ExeDir()), display)
 }
 
 // Settings controls are accessed only on the UI thread.
@@ -222,7 +227,7 @@ func (u *ui) build() error {
 					Composite{Layout: VBox{Spacing: 6}, Children: []Widget{
 						Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
 							PushButton{Text: mf("bInstall.Caption", "Install"), OnClicked: func() {
-								u.runOp(msg("OpInstall", "install"), func(log *logx.Logger) error { return app.Install(log) })
+								u.runOperation(msg("OpInstall", "install"), app.OpInstall)
 							}},
 							PushButton{Text: mf("bUninstall.Caption", "Uninstall"), OnClicked: u.onUninstall},
 							PushButton{Text: mf("bUpdateINI.Caption", "Update INI"), ToolTipText: mf("bUpdateINI.ToolTip", "Only downloads the latest patch database from GitHub; it does not apply it. Use Restart Service to apply."), OnClicked: func() {
@@ -231,13 +236,10 @@ func (u *ui) build() error {
 						}},
 						Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
 							PushButton{Text: mf("bRestartService.Caption", "Restart Service"), ToolTipText: mf("bRestartService.ToolTip", "Restarts the RdpMux service to load and apply the current patch database. If the patches for the running termsrv version changed, TermService is also restarted (active RDP sessions disconnect)."), OnClicked: func() {
-								u.runOp(msg("OpRestartService", "restart service"), func(log *logx.Logger) error { return app.RestartService(log) })
+								u.runOperation(msg("OpRestartService", "restart service"), app.OpRestartService)
 							}},
 							PushButton{Text: mf("bRestartTS.Caption", "Restart TermService"), ToolTipText: mf("bRestartTS.ToolTip", "Restarts TermService only (disconnects active RDP sessions). Does not reload the patch database; use Restart Service to apply an updated database."), OnClicked: func() {
-								u.runOp(msg("OpRestart", "restart"), func(log *logx.Logger) error {
-									log.Info("%s", msg("LogRestartingTermService", "restarting TermService..."))
-									return sysconfig.RestartTermService()
-								})
+								u.runOperation(msg("OpRestart", "restart"), app.OpRestartTerm)
 							}},
 						}},
 					}},
@@ -408,6 +410,7 @@ func (u *ui) writeSettings(closeOnSuccess bool) <-chan struct{} {
 		return nil
 	}
 	s := u.settings.snapshotSettings()
+	portChanged := u.oldPort != s.Port
 	u.setBusy(true)
 	done := make(chan struct{})
 	go func() {
@@ -419,6 +422,9 @@ func (u *ui) writeSettings(closeOnSuccess bool) <-chan struct{} {
 				u.dirty = false
 			}
 			u.settings.reportSave(err)
+			if err == nil && portChanged {
+				u.logLine(msg("LogPortApplyHint", "RDP port changed; restart TermService to apply the new port"))
+			}
 			u.setBusy(false)
 			if err == nil && closeOnSuccess {
 				u.settings.close()
@@ -455,7 +461,7 @@ func (u *ui) onUninstall() {
 	if walk.MsgBox(u.mw, msg("Warning", "Warning"), msgText, walk.MsgBoxYesNo|walk.MsgBoxIconWarning) != win.IDYES {
 		return
 	}
-	u.runOp(msg("OpUninstall", "uninstall"), func(log *logx.Logger) error { return app.Uninstall(log) })
+	u.runOperation(msg("OpUninstall", "uninstall"), app.OpUninstall)
 }
 
 func (u *ui) stopped() bool {
@@ -527,7 +533,33 @@ func (u *ui) runOp(label string, op func(*logx.Logger) error) {
 	}()
 }
 
+// runOperation executes op in the out-of-session host and streams its log into
+// the log panel.
+func (u *ui) runOperation(label, op string) {
+	if u.opBusy || u.stopped() {
+		return
+	}
+	u.setBusy(true)
+	u.logLine("=== " + label + " ===")
+	go func() {
+		err := u.backend.RunOperation(op, guiWriter{u})
+		u.post(func() {
+			if err != nil {
+				u.logLine(msg("LogOpError", "error: %s", err))
+			}
+			if err == nil && !u.dirty {
+				u.readSettings()
+			}
+			u.refreshStatusAsync()
+			u.setBusy(false)
+		})
+	}()
+}
+
 func (u *ui) logLine(s string) {
+	if u.log == nil {
+		return
+	}
 	u.log.AppendText(time.Now().Format("15:04:05 ") + s + "\r\n")
 }
 

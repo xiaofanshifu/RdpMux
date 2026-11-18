@@ -2,6 +2,7 @@ package gui
 
 import (
 	"errors"
+	"io"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,10 +14,14 @@ import (
 type fakeBackend struct {
 	status func() app.Status
 	write  func(sysconfig.Settings) error
+	run    func(string, io.Writer) error
 }
 
 func (b fakeBackend) Status() app.Status                       { return b.status() }
 func (b fakeBackend) WriteSettings(s sysconfig.Settings) error { return b.write(s) }
+func (b fakeBackend) RunOperation(op string, display io.Writer) error {
+	return b.run(op, display)
+}
 
 type fakeSettings struct {
 	value        sysconfig.Settings

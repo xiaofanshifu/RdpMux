@@ -14,6 +14,11 @@ import (
 
 const SC_ENUM_PROCESS_INFO = 0
 
+// stopBeginTimeout bounds how long a stop request may take to take effect. The
+// SCM marks a service STOP_PENDING as soon as it processes the control, so a
+// service that is still RUNNING after this long never began stopping.
+const stopBeginTimeout = 10 * time.Second
+
 type OpError struct {
 	Op  string
 	Err error
@@ -21,6 +26,20 @@ type OpError struct {
 
 func (e *OpError) Error() string { return e.Op + ": " + e.Err.Error() }
 func (e *OpError) Unwrap() error { return e.Err }
+
+// ErrServiceReplaced reports that the service instance changed while a stop was
+// pending: the service was started again (for example by SCM failure recovery)
+// before it reported Stopped. A new instance runs unpatched code, so callers
+// that stop a service to clear in-memory patches can treat it as a restart.
+var ErrServiceReplaced = errors.New("service instance was replaced")
+
+// ErrStopNotStarted reports that a stop request never took effect: the service
+// kept running without reporting a stop transition. Waiting for the full
+// timeout cannot succeed, so the wait fails as soon as the grace period ends.
+// A service that restarts within its own process (same pid) and completes the
+// cycle between polls is indistinguishable from an ignored request and is
+// reported instead of being assumed to have restarted.
+var ErrStopNotStarted = errors.New("service did not begin stopping")
 
 func openSCM(access uint32) (windows.Handle, error) {
 	h, err := windows.OpenSCManager(nil, nil, access)
@@ -86,12 +105,19 @@ func SvcSetStart(name string, startType uint32) error {
 	return nil
 }
 
-func queryServiceState(h windows.Handle) (uint32, error) {
-	var status windows.SERVICE_STATUS
-	if err := windows.QueryServiceStatus(h, &status); err != nil {
-		return 0, &OpError{"QueryServiceStatus", err}
+// ServiceStatus is a snapshot of the service instance behind a handle.
+type ServiceStatus struct {
+	State uint32
+	PID   uint32
+}
+
+func queryServiceStatus(h windows.Handle) (ServiceStatus, error) {
+	var ssp windows.SERVICE_STATUS_PROCESS
+	var needed uint32
+	if err := windows.QueryServiceStatusEx(h, windows.SC_STATUS_PROCESS_INFO, (*byte)(unsafe.Pointer(&ssp)), uint32(unsafe.Sizeof(ssp)), &needed); err != nil {
+		return ServiceStatus{}, &OpError{"QueryServiceStatusEx", err}
 	}
-	return status.CurrentState, nil
+	return ServiceStatus{State: ssp.CurrentState, PID: ssp.ProcessId}, nil
 }
 
 func waitServiceState(name string, target uint32, query func() (uint32, error), timeout time.Duration) error {
@@ -127,7 +153,10 @@ func SvcStart(name string) error {
 		return err
 	}
 	defer windows.CloseServiceHandle(h)
-	query := func() (uint32, error) { return queryServiceState(h) }
+	query := func() (uint32, error) {
+		st, err := queryServiceStatus(h)
+		return st.State, err
+	}
 	state, err := query()
 	if err != nil {
 		return err
@@ -148,7 +177,9 @@ func SvcStart(name string) error {
 	return waitServiceState(name, windows.SERVICE_RUNNING, query, 60*time.Second)
 }
 
-// SvcStop also waits for a stop that was already pending.
+// SvcStop also waits for a stop that was already pending. A request that never
+// takes effect is reported as ErrStopNotStarted instead of waiting out the
+// full timeout.
 func SvcStop(name string) error {
 	scm, err := openSCM(windows.SC_MANAGER_CONNECT)
 	if err != nil {
@@ -160,21 +191,77 @@ func SvcStop(name string) error {
 		return err
 	}
 	defer windows.CloseServiceHandle(h)
-	query := func() (uint32, error) { return queryServiceState(h) }
-	state, err := query()
+	query := func() (ServiceStatus, error) { return queryServiceStatus(h) }
+	st, err := query()
 	if err != nil {
 		return err
 	}
-	if state == windows.SERVICE_STOPPED {
+	if st.State == windows.SERVICE_STOPPED {
 		return nil
 	}
-	if state != windows.SERVICE_STOP_PENDING {
+	if st.State == windows.SERVICE_START_PENDING {
+		// The SCM rejects a stop control while a service is still starting, so
+		// wait for it to become controllable instead of failing immediately.
+		if err := waitServiceState(name, windows.SERVICE_RUNNING, func() (uint32, error) {
+			cur, err := query()
+			return cur.State, err
+		}, 15*time.Second); err != nil {
+			if cur, qerr := query(); qerr == nil && cur.State == windows.SERVICE_STOPPED {
+				return nil // The pending start failed; the service is already stopped.
+			}
+			return err
+		}
+		if st, err = query(); err != nil {
+			return err
+		}
+		if st.State == windows.SERVICE_STOPPED {
+			return nil
+		}
+	}
+	if st.State != windows.SERVICE_STOP_PENDING {
 		var status windows.SERVICE_STATUS
 		if err := windows.ControlService(h, windows.SERVICE_CONTROL_STOP, &status); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
 			return &OpError{"ControlService", err}
 		}
 	}
-	return waitServiceState(name, windows.SERVICE_STOPPED, query, 60*time.Second)
+	return waitServiceStopped(name, st.PID, query, 60*time.Second)
+}
+
+// waitServiceStopped reports ErrServiceReplaced as soon as the instance behind
+// the handle changes, instead of waiting out the timeout for a state the old
+// instance will never reach. A request that never begins stopping is reported
+// after stopBeginTimeout rather than at the end of the full timeout.
+func waitServiceStopped(name string, wantPID uint32, query func() (ServiceStatus, error), timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	begin := time.Now()
+	beginDeadline := min(timeout, stopBeginTimeout)
+	sawPending := false
+	for {
+		st, err := query()
+		if err != nil {
+			return err
+		}
+		if st.State == windows.SERVICE_STOPPED {
+			return nil
+		}
+		if st.PID != 0 && wantPID != 0 && st.PID != wantPID {
+			return fmt.Errorf("%s restarted instead of stopping (pid %d -> %d): %w", name, wantPID, st.PID, ErrServiceReplaced)
+		}
+		if st.State == windows.SERVICE_STOP_PENDING {
+			sawPending = true
+		}
+		if sawPending && (st.State == windows.SERVICE_RUNNING || st.State == windows.SERVICE_START_PENDING) {
+			return fmt.Errorf("%s restarted instead of stopping (state %d): %w", name, st.State, ErrServiceReplaced)
+		}
+		if !sawPending && time.Since(begin) > beginDeadline {
+			return fmt.Errorf("%s did not begin stopping within %s: %w", name, beginDeadline, ErrStopNotStarted)
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("%s did not reach state %d within %s: %w", name, windows.SERVICE_STOPPED, timeout, windows.ERROR_SERVICE_REQUEST_TIMEOUT)
+		}
+		time.Sleep(min(100*time.Millisecond, remaining))
+	}
 }
 
 type ServiceInfo struct {
@@ -294,10 +381,9 @@ func SvcQueryState(name string) (state uint32, pid uint32, err error) {
 		return 0, 0, err
 	}
 	defer windows.CloseServiceHandle(h)
-	var ssp windows.SERVICE_STATUS_PROCESS
-	var needed uint32
-	if err := windows.QueryServiceStatusEx(h, windows.SC_STATUS_PROCESS_INFO, (*byte)(unsafe.Pointer(&ssp)), uint32(unsafe.Sizeof(ssp)), &needed); err != nil {
-		return 0, 0, &OpError{"QueryServiceStatusEx", err}
+	st, err := queryServiceStatus(h)
+	if err != nil {
+		return 0, 0, err
 	}
-	return ssp.CurrentState, ssp.ProcessId, nil
+	return st.State, st.PID, nil
 }

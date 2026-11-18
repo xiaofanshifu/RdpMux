@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"rdpmux/internal/assets"
 	"rdpmux/internal/loc"
 	"rdpmux/internal/logx"
+	"rdpmux/internal/sysconfig"
 )
 
 func TestNewLoggerReportsFileFailureWithoutConsole(t *testing.T) {
@@ -160,6 +162,149 @@ func TestWaitForPatchCannotReportInactiveAsSuccess(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) || calls != 1 {
 		t.Fatalf("inactive patches were reported as successful: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestListenerOnlyError(t *testing.T) {
+	listener := fmt.Errorf("TermService is running but the %w", sysconfig.ErrListenerNotReady)
+	other := errors.New("stop UmRdpService: access denied")
+	for _, tt := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"listener", listener, true},
+		{"joined listener", errors.Join(listener), true},
+		{"two listeners", errors.Join(listener, listener), true},
+		{"listener and stop failure", errors.Join(listener, other), false},
+		{"unrelated failure", other, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := listenerOnlyError(tt.err); got != tt.want {
+				t.Fatalf("listenerOnlyError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOperationResult(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		data    string
+		wantErr bool
+	}{
+		{"ok", "ok\n", false},
+		{"ok without newline", "ok", false},
+		{"failure", "error: stop TermService: timeout\n", true},
+		{"empty", "", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := operationResult(tt.data)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("operationResult(%q) = %v, want error %v", tt.data, err, tt.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), strings.TrimPrefix(strings.TrimSpace(tt.data), "error: ")) {
+				t.Fatalf("result text lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestFollowOperationStreamsLogAndResult(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "op.log")
+	resultPath := filepath.Join(dir, "op.result")
+	if err := os.WriteFile(logPath, []byte("line one\r\nline two\r\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resultPath, []byte("ok\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	complete, err := followOperation(&out, logPath, resultPath, 5*time.Second)
+	if err != nil || !complete {
+		t.Fatalf("complete=%v err=%v", complete, err)
+	}
+	if out.String() != "line one\r\nline two\r\n" {
+		t.Fatalf("streamed log = %q", out.String())
+	}
+}
+
+func TestFollowOperationReportsHostFailure(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "op.log")
+	resultPath := filepath.Join(dir, "op.result")
+	if err := os.WriteFile(logPath, []byte("started\r\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resultPath, []byte("error: stop TermService: timeout\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	complete, err := followOperation(&out, logPath, resultPath, 5*time.Second)
+	if err == nil || err.Error() != "stop TermService: timeout" || !complete {
+		t.Fatalf("complete=%v error=%v", complete, err)
+	}
+	if out.String() != "started\r\n" {
+		t.Fatalf("streamed log = %q", out.String())
+	}
+}
+
+func TestFollowOperationTimesOutWithoutResult(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "op.log")
+	if err := os.WriteFile(logPath, []byte("started\r\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	complete, err := followOperation(&out, logPath, filepath.Join(dir, "missing.result"), 150*time.Millisecond)
+	if err == nil || complete {
+		t.Fatalf("complete=%v error=%v", complete, err)
+	}
+	if !strings.Contains(err.Error(), logPath) {
+		t.Fatalf("error does not point at the retained log: %v", err)
+	}
+	if out.String() != "started\r\n" {
+		t.Fatalf("streamed log = %q", out.String())
+	}
+}
+
+func TestExecuteOperationRejectsUnknown(t *testing.T) {
+	if err := executeOperation("no-such-operation", logx.Discard); err == nil {
+		t.Fatal("unknown operation was accepted")
+	}
+}
+
+func TestServeOperationHost(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		args        []string
+		wantHandled bool
+	}{
+		{"no args", nil, false},
+		{"normal command", []string{"install"}, false},
+		{"host entry", []string{OperationCommand}, true},
+		{"host entry with args", []string{OperationCommand, "install"}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			handled, err := ServeOperationHost(tt.args)
+			if handled != tt.wantHandled {
+				t.Fatalf("handled = %v, want %v", handled, tt.wantHandled)
+			}
+			if handled && err == nil {
+				t.Fatalf("invalid host arguments were accepted")
+			}
+		})
+	}
+}
+
+func TestRunOperationHostRequiresArguments(t *testing.T) {
+	if err := RunOperationHost(nil); err == nil {
+		t.Fatal("missing arguments were accepted")
+	}
+	if err := RunOperationHost([]string{"install", "info", "log"}); err == nil {
+		t.Fatal("incomplete arguments were accepted")
 	}
 }
 

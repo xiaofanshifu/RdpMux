@@ -36,7 +36,6 @@ build.bat
 
 - `rdpmux.exe`
 - `rdpmuxgui.exe`
-- `RdpMux-win64.zip`
 
 ## 使用
 
@@ -78,17 +77,24 @@ rdpmux.exe patch
 rdpmux.exe uninstall
 ```
 
-卸载会移除补丁服务并重启 TermService 以清除内存补丁（当前活动的 RDP 会话将断开），**远程桌面保持启用**，恢复原版单会话行为。无法立即删除的自身程序或日志文件会安排在下次重启后删除。若上次卸载中断、仍有残留，再次卸载会继续完成清理。
+卸载会移除补丁服务并重启 TermService 以清除内存补丁（当前活动的 RDP 会话将断开），**远程桌面保持启用**，恢复原版单会话行为——这里恢复的是 `termsrv.dll` 的内存补丁；安装时写入的 `EnableConcurrentSessions`、`AllowMultipleTSSessions`、`Terminal Server\AddIns` 及 `CertPropSvc`/`SessionEnv` 启动类型不会回滚（这些值在客户端版本上基本不参与会话限制）。无法立即删除的自身程序或日志文件会安排在下次重启后删除。若上次卸载中断、仍有残留，再次卸载会继续完成清理。
 
-图形界面的操作与命令行一致，安装、卸载、更新 INI、重启服务和重启 TermService 按钮位于主窗口中；更新/重启类按钮与端口输入框带有悬浮提示。语言下拉框会立即切换界面语言，尚未保存的设置和日志内容不会丢失。
+安装、卸载、重启服务与重启 TermService 都由一个临时服务在会话外执行（SYSTEM，完成后自动删除），客户端只负责提交操作并显示日志。因此即使在 RDP 会话内操作、会话被 TermService 断开，操作本身仍会继续完成，重连后即可使用；日志会记录完整过程与结果。
 
-RdpMux 不自动管理 Windows 防火墙规则；请自行确保防火墙放行 RDP 端口（GUI 端口输入框的悬浮提示亦有说明）。
+旧版本可能留下 `RdpMux TCP/UDP` 防火墙规则。新版不创建也不删除防火墙规则，因为无法可靠判断这些规则是否是唯一放行 RDP 端口的入站规则，删除后可能切断远程访问；如需清理，请自行执行 `netsh advfirewall firewall delete rule name="RdpMux TCP"` 与 `name="RdpMux UDP"`。
+
+图形界面的操作与命令行一致，安装、卸载、更新 INI、重启服务和重启 TermService 按钮位于主窗口中；更新/重启类按钮与端口输入框带有悬浮提示。语言下拉框会立即切换界面语言，尚未保存的设置和日志内容不会丢失。在 RDP 会话内执行安装/卸载/重启时，会话会断开，但操作由临时服务继续完成，重连后查看状态与日志即可。更新 INI 只下载文件、不改变服务状态，仍在当前进程内执行。
+
+安装与重启 TermService 结束后都会确认监听器真的在配置端口上接受连接：Windows 只在 TermService 启动时读取 `fDenyTSConnections`，因此安装时若 Remote Desktop 原本关闭而服务已在运行，会先重启一次 TermService 以重建监听器；重启后仍无法连接则明确报错，不再把“补丁生效”当作安装成功。
+
+RdpMux 不自动管理 Windows 防火墙规则；请自行确保防火墙放行 RDP 端口（GUI 端口输入框的悬浮提示亦有说明）。状态页显示的监听状态通过查询本机 TCP 监听表确认，既不看 WinStation 是否存在，也不主动建立连接（裸连接会在 TermService 侧留下 CLOSE_WAIT）。
 
 ## 运行要求
 
 补丁只修改内存，不改动磁盘上的 `termsrv.dll`。因此在以下情况补丁会丢失，需要重新应用：**重启电脑**、**TermService 服务重启**、**Windows 更新替换 termsrv.dll**。
 
 - **RdpMux 服务**：需要常驻。安装后设为开机自启的后台服务，自动校验并重新应用补丁，无需手动保持任何窗口打开。服务很轻量（几 MB 内存，每 5 秒校验一次）。
+- **TermService 的启动不由 RdpMux 负责**：服务只在 TermService 运行时附加并打补丁，检测到未运行只记录 detached，不代为启动（避免覆盖管理员的启动类型设置）。
 - **GUI / CLI**：只是管理工具，用完即可关闭，不影响多会话。
 - **停止 RdpMux 服务**：当前已生效的补丁仍保持多会话，但下次重启或 TermService 重启后不再自动恢复。
 - **不想常驻服务**：可不安装服务，改为每次开机后手动执行 `rdpmux.exe patch` 应用一次，效果持续到下次重启。

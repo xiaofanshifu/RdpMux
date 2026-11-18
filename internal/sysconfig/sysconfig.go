@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -21,6 +22,37 @@ const (
 	RegTSPolicy  = `SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services`
 	RegSysPolicy = `SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`
 )
+
+const (
+	afInet                 = 2
+	afInet6                = 23
+	tcpTableOwnerPIDListen = 3
+)
+
+var (
+	iphlpapi                = windows.NewLazySystemDLL("iphlpapi.dll")
+	procGetExtendedTcpTable = iphlpapi.NewProc("GetExtendedTcpTable")
+)
+
+type mibTCPRowOwnerPID struct {
+	State      uint32
+	LocalAddr  uint32
+	LocalPort  uint32
+	RemoteAddr uint32
+	RemotePort uint32
+	OwningPID  uint32
+}
+
+type mibTCP6RowOwnerPID struct {
+	LocalAddr     [16]byte
+	LocalScopeID  uint32
+	LocalPort     uint32
+	RemoteAddr    [16]byte
+	RemoteScopeID uint32
+	RemotePort    uint32
+	State         uint32
+	OwningPID     uint32
+}
 
 type rdpChanges struct {
 	undo []func() error
@@ -268,13 +300,43 @@ type termServiceOps struct {
 	query      func(string) (uint32, uint32, error)
 	stop       func(string) error
 	start      func(string) error
+	// listener verifies that RDP accepts connections again after the restart.
+	// Nil disables the check.
+	listener func() bool
+	// log receives diagnostics; nil discards them.
+	log func(string, ...any)
 }
 
-func RestartTermService() error {
-	return restartTermService(termServiceOps{
+func (o termServiceOps) logf(format string, args ...any) {
+	if o.log != nil {
+		o.log(format, args...)
+	}
+}
+
+// ErrListenerNotReady reports that TermService is running but RDP does not
+// accept connections on the configured port.
+var ErrListenerNotReady = errors.New("RDP listener is not accepting connections")
+
+// InfoLogger is the subset of logx.Logger used here.
+type InfoLogger interface {
+	Info(format string, args ...any)
+}
+
+func RestartTermService(log InfoLogger) error {
+	ops := termServiceOps{
 		find: winutil.FindTermService, dependents: winutil.DependentServices,
 		query: winutil.SvcQueryState, stop: winutil.SvcStop, start: winutil.SvcStart,
-	})
+		listener: func() bool {
+			if !RDPEnabled() {
+				return true // Remote Desktop is off; no listener is expected.
+			}
+			return WaitListenerReady(5 * time.Second)
+		},
+	}
+	if log != nil {
+		ops.log = log.Info
+	}
+	return restartTermService(ops)
 }
 
 func restartTermService(ops termServiceOps) error {
@@ -322,10 +384,25 @@ func restartTermService(ops termServiceOps) error {
 	for _, name := range names {
 		// A timed-out stop may still complete and need restoration.
 		restore = append(restore, name)
-		if err := ops.stop(name); err != nil {
-			errs = append(errs, fmt.Errorf("stop %s: %w", name, err))
-			break // Do not proceed to stop its dependencies after a failure.
+		err := ops.stop(name)
+		if err != nil && strings.EqualFold(name, "TermService") && errors.Is(err, winutil.ErrStopNotStarted) {
+			// The request may have been processed between polls: a restart
+			// inside the same process keeps the pid and never shows a pending
+			// state. Ask again instead of reporting an outcome we cannot know.
+			err = ops.stop(name)
 		}
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, winutil.ErrServiceReplaced) && strings.EqualFold(name, "TermService") {
+			// The SCM started TermService again while it was stopping. The new
+			// instance runs unpatched code, which is what this restart exists
+			// to guarantee, so only the dependents still need restoring.
+			ops.logf("TermService restarted while stopping; its patches are cleared")
+			continue
+		}
+		errs = append(errs, fmt.Errorf("stop %s: %w", name, err))
+		break // Do not proceed to stop its dependencies after a failure.
 	}
 	for i := len(restore) - 1; i >= 0; i-- {
 		name := restore[i]
@@ -333,40 +410,109 @@ func restartTermService(ops termServiceOps) error {
 			errs = append(errs, fmt.Errorf("start %s: %w", name, err))
 		}
 	}
+	// A restart that leaves TermService running without a listener still leaves
+	// RDP unusable, so report it instead of claiming success.
+	if ops.listener != nil {
+		if state, _, err := ops.query("TermService"); err == nil && state == windows.SERVICE_RUNNING && !ops.listener() {
+			errs = append(errs, fmt.Errorf("TermService is running but the %w", ErrListenerNotReady))
+		}
+	}
 	return errors.Join(errs...)
 }
 
-func InstallDir() string {
-	return winutil.ExpandPath(`%ProgramFiles%\RdpMux`)
+const DefaultRDPPort uint32 = 3389
+
+// ListenerPort returns the configured RDP port.
+func ListenerPort() uint32 {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, RegRDPTcp, winutil.RegAccess(false))
+	if err != nil {
+		return DefaultRDPPort
+	}
+	defer k.Close()
+	if v, ok := readInt(k, "PortNumber"); ok && v > 0 {
+		return v
+	}
+	return DefaultRDPPort
 }
 
-var (
-	winsta                  = windows.NewLazySystemDLL("winsta.dll")
-	procWinStationEnumerate = winsta.NewProc("WinStationEnumerateW")
-	procWinStationFreeMem   = winsta.NewProc("WinStationFreeMemory")
-)
-
-type winStationInfo struct {
-	SessionID uint32
-	Name      [34]uint16
-	State     uint32
-}
-
-func IsListenerWorking() bool {
-	var sessions *winStationInfo
-	var count uint32
-	ret, _, _ := procWinStationEnumerate.Call(0, uintptr(unsafe.Pointer(&sessions)), uintptr(unsafe.Pointer(&count)))
-	if ret == 0 || sessions == nil {
+// RDPEnabled reports whether remote desktop connections are allowed.
+func RDPEnabled() bool {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, RegTS, winutil.RegAccess(false))
+	if err != nil {
 		return false
 	}
-	defer procWinStationFreeMem.Call(uintptr(unsafe.Pointer(sessions)))
-	list := unsafe.Slice(sessions, int(count))
-	for i := range list {
-		if windows.UTF16ToString(list[i].Name[:]) == "RDP-Tcp" {
+	defer k.Close()
+	deny, ok := readBool(k, "fDenyTSConnections")
+	return ok && !deny
+}
+
+// ListenerReady reports whether the port has a listening socket. It reads the
+// TCP table instead of connecting: a probe connection is never accepted by the
+// RDP listener and stays in CLOSE_WAIT on the TermService side.
+func ListenerReady(port uint32) bool {
+	if port == 0 || port > 65535 {
+		return false
+	}
+	return tcpTableListening(afInet, port) || tcpTableListening(afInet6, port)
+}
+
+func tcpTableListening(family, port uint32) bool {
+	var size uint32
+	ret, _, _ := procGetExtendedTcpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, uintptr(family), tcpTableOwnerPIDListen, 0)
+	if ret != uintptr(windows.ERROR_INSUFFICIENT_BUFFER) || size < 4 {
+		return false
+	}
+	buf := make([]byte, size)
+	ret, _, _ = procGetExtendedTcpTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0, uintptr(family), tcpTableOwnerPIDListen, 0)
+	if ret != 0 || size < 4 {
+		return false
+	}
+	count := uint64(*(*uint32)(unsafe.Pointer(&buf[0])))
+	if family == afInet {
+		if 4+count*uint64(unsafe.Sizeof(mibTCPRowOwnerPID{})) > uint64(len(buf)) {
+			return false
+		}
+		for _, row := range unsafe.Slice((*mibTCPRowOwnerPID)(unsafe.Add(unsafe.Pointer(&buf[0]), 4)), int(count)) {
+			if networkPort(row.LocalPort) == uint16(port) {
+				return true
+			}
+		}
+		return false
+	}
+	if 4+count*uint64(unsafe.Sizeof(mibTCP6RowOwnerPID{})) > uint64(len(buf)) {
+		return false
+	}
+	for _, row := range unsafe.Slice((*mibTCP6RowOwnerPID)(unsafe.Add(unsafe.Pointer(&buf[0]), 4)), int(count)) {
+		if networkPort(row.LocalPort) == uint16(port) {
 			return true
 		}
 	}
 	return false
+}
+
+func networkPort(value uint32) uint16 {
+	return uint16(value&0xff)<<8 | uint16(value>>8&0xff)
+}
+
+// WaitListenerReady waits for the configured RDP port to have a listening
+// socket.
+func WaitListenerReady(timeout time.Duration) bool {
+	port := ListenerPort()
+	deadline := time.Now().Add(timeout)
+	for {
+		if ListenerReady(port) {
+			return true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		time.Sleep(min(200*time.Millisecond, remaining))
+	}
+}
+
+func InstallDir() string {
+	return winutil.ExpandPath(`%ProgramFiles%\RdpMux`)
 }
 
 func Arch() string {

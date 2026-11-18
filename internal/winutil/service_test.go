@@ -104,3 +104,81 @@ func TestWaitServiceStateWaitsForRunning(t *testing.T) {
 		t.Fatalf("error = %v, queries = %d", err, calls)
 	}
 }
+
+func TestWaitServiceStoppedDetectsReplacementByPID(t *testing.T) {
+	calls := 0
+	start := time.Now()
+	err := waitServiceStopped("TermService", 5520, func() (ServiceStatus, error) {
+		calls++
+		if calls == 1 {
+			return ServiceStatus{State: windows.SERVICE_STOP_PENDING, PID: 5520}, nil
+		}
+		return ServiceStatus{State: windows.SERVICE_RUNNING, PID: 1752}, nil
+	}, 2*time.Second)
+	if !errors.Is(err, ErrServiceReplaced) {
+		t.Fatalf("error = %v, want ErrServiceReplaced", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("replacement was not reported promptly: %s", elapsed)
+	}
+}
+
+func TestWaitServiceStoppedDetectsRestartWithoutPID(t *testing.T) {
+	states := []uint32{windows.SERVICE_STOP_PENDING, windows.SERVICE_START_PENDING, windows.SERVICE_RUNNING}
+	calls := 0
+	err := waitServiceStopped("TermService", 0, func() (ServiceStatus, error) {
+		state := states[len(states)-1]
+		if calls < len(states) {
+			state = states[calls]
+		}
+		calls++
+		return ServiceStatus{State: state}, nil
+	}, 2*time.Second)
+	if !errors.Is(err, ErrServiceReplaced) {
+		t.Fatalf("error = %v, want ErrServiceReplaced", err)
+	}
+}
+
+func TestWaitServiceStoppedToleratesLateStopPending(t *testing.T) {
+	seq := []ServiceStatus{
+		{State: windows.SERVICE_RUNNING, PID: 5520},
+		{State: windows.SERVICE_STOP_PENDING, PID: 5520},
+		{State: windows.SERVICE_STOPPED},
+	}
+	calls := 0
+	err := waitServiceStopped("TermService", 5520, func() (ServiceStatus, error) {
+		st := seq[len(seq)-1]
+		if calls < len(seq) {
+			st = seq[calls]
+		}
+		calls++
+		return st, nil
+	}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("a pending stop was reported as a restart: %v", err)
+	}
+}
+
+func TestWaitServiceStoppedTimesOutWhenServiceHangs(t *testing.T) {
+	err := waitServiceStopped("test", 1, func() (ServiceStatus, error) {
+		return ServiceStatus{State: windows.SERVICE_STOP_PENDING, PID: 1}, nil
+	}, 0)
+	if !errors.Is(err, windows.ERROR_SERVICE_REQUEST_TIMEOUT) {
+		t.Fatalf("error = %v, want timeout", err)
+	}
+}
+
+// A service that keeps running with an unchanged pid never began stopping: the
+// stop must be reported after the grace period instead of at the full timeout.
+func TestWaitServiceStoppedReportsStopThatNeverStarts(t *testing.T) {
+	start := time.Now()
+	err := waitServiceStopped("TermService", 5520, func() (ServiceStatus, error) {
+		return ServiceStatus{State: windows.SERVICE_RUNNING, PID: 5520}, nil
+	}, 300*time.Millisecond)
+	if !errors.Is(err, ErrStopNotStarted) {
+		t.Fatalf("error = %v, want ErrStopNotStarted", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("stop that never began took %s", elapsed)
+	}
+}

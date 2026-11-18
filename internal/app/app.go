@@ -310,7 +310,7 @@ func Install(log *logx.Logger) (err error) {
 			// TermService was already running and the patch service may have
 			// patched its memory; restart it so a failed install does not
 			// leave patches active after reporting failure.
-			err = errors.Join(err, sysconfig.RestartTermService())
+			err = errors.Join(err, sysconfig.RestartTermService(log))
 		}
 		if restoreStart != nil {
 			err = errors.Join(err, restoreStart())
@@ -344,6 +344,9 @@ func Install(log *logx.Logger) (err error) {
 		}
 		termStarted = true
 	}
+	if err = ensureRDPListener(log, termStarted); err != nil {
+		return err
+	}
 	if err = winsvc.Start(); err != nil {
 		return err
 	}
@@ -356,6 +359,52 @@ func Install(log *logx.Logger) (err error) {
 	}
 	log.Info("%s", tr("LogInstalled", "installed; the service maintains concurrent sessions"))
 	return nil
+}
+
+// ensureRDPListener verifies that enabling Remote Desktop actually produced a
+// listener. Windows reads fDenyTSConnections when TermService starts, so a
+// service that was already running keeps the old setting in memory and never
+// binds the port; restarting it once is the documented way to apply the change.
+func ensureRDPListener(log *logx.Logger, termStarted bool) error {
+	if !sysconfig.RDPEnabled() {
+		return nil
+	}
+	if sysconfig.WaitListenerReady(10 * time.Second) {
+		return nil
+	}
+	if termStarted {
+		return fmt.Errorf("%s", tr("ErrListenerNotReady", "RDP is enabled but no listener accepts connections on port %d", sysconfig.ListenerPort()))
+	}
+	log.Warn("%s", tr("LogListenerRestart", "RDP is enabled but not listening; restarting TermService to recreate the listener..."))
+	if err := sysconfig.RestartTermService(log); err != nil {
+		return err
+	}
+	if !sysconfig.WaitListenerReady(5 * time.Second) {
+		return fmt.Errorf("%s", tr("ErrListenerNotReady", "RDP is enabled but no listener accepts connections on port %d", sysconfig.ListenerPort()))
+	}
+	return nil
+}
+
+// listenerOnlyError reports whether err consists solely of listener failures.
+// Uninstall downgrades those to a warning; every other failure aborts it.
+func listenerOnlyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return errors.Is(err, sysconfig.ErrListenerNotReady)
+	}
+	errs := joined.Unwrap()
+	if len(errs) == 0 {
+		return false
+	}
+	for _, one := range errs {
+		if !errors.Is(one, sysconfig.ErrListenerNotReady) {
+			return false
+		}
+	}
+	return true
 }
 
 func Uninstall(log *logx.Logger) error {
@@ -383,8 +432,14 @@ func Uninstall(log *logx.Logger) error {
 		return err
 	}
 	log.Info("%s", tr("LogRestartingTermService", "restarting TermService to clear patches (active RDP sessions will disconnect)..."))
-	if err := sysconfig.RestartTermService(); err != nil {
-		return err
+	if err := sysconfig.RestartTermService(log); err != nil {
+		// Uninstall removes the product; a listener that does not come back is
+		// reported but must not block the cleanup that is already in progress.
+		// Any other failure still aborts, because a service may be left stopped.
+		if !listenerOnlyError(err) {
+			return err
+		}
+		log.Warn("%s", tr("LogUninstallListenerWarn", "TermService restarted but RDP is not accepting connections; check the RDP port and firewall"))
 	}
 	log.Info("%s", tr("LogUninstallKeepRDP", "Remote Desktop remains enabled with stock single-session behavior"))
 	dir := sysconfig.InstallDir()
@@ -470,11 +525,29 @@ func verifyServicePatches(db *patcher.DB, log *logx.Logger) error {
 	return nil
 }
 
+// RestartTermService restarts TermService through the shared management mutex,
+// so it cannot overlap an install, uninstall or patch-service restart.
+func RestartTermService(log *logx.Logger) error {
+	unlock, err := beginOperation()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	log.Info("%s", tr("LogRestartingTermService", "restarting TermService to clear patches (active RDP sessions will disconnect)..."))
+	if err := sysconfig.RestartTermService(log); err != nil {
+		return err
+	}
+	_, pid, _ := sysconfig.TermServiceState()
+	log.Info("%s", tr("LogTermServiceRestarted", "TermService restarted (pid %d)", pid))
+	return nil
+}
+
 // RestartService restarts the patch service so it reloads the on-disk patch
 // database and applies it. Updating the database alone does not apply it; this
 // is the explicit apply step. If the running TermService already holds patches
-// that differ from the new database, TermService is restarted first to clear
-// them, since they cannot be replaced in place.
+// that differ from the new database, the patch service is stopped first and
+// TermService is restarted to clear them, since they cannot be replaced in
+// place and a live watcher would re-apply the previous database.
 func RestartService(log *logx.Logger) error {
 	unlock, err := beginOperation()
 	if err != nil {
@@ -491,12 +564,22 @@ func RestartService(log *logx.Logger) error {
 	if err != nil {
 		return err
 	}
-	if stale, staleErr := stalePatchesInMemory(db); staleErr != nil {
-		log.Warn("%s", tr("LogStaleCheckWarn", "could not inspect current patches: %s", staleErr))
-	} else if stale {
-		log.Info("%s", tr("LogRestartingTermService", "restarting TermService to clear patches (active RDP sessions will disconnect)..."))
-		if err := sysconfig.RestartTermService(); err != nil {
+	stale, err := stalePatchesInMemory(db)
+	if err != nil {
+		// Proceeding would restart the patch service against memory whose patch
+		// state is unknown, then fail verification with a misleading error.
+		return fmt.Errorf("%s: %w", tr("ErrStaleCheck", "cannot inspect the patches in TermService memory"), err)
+	}
+	if stale {
+		// Stop the patch service before TermService: a running watcher would
+		// re-apply the previous database to the new TermService instance, and
+		// the new database cannot overwrite bytes it does not recognize.
+		if err := winsvc.Stop(); err != nil {
 			return err
+		}
+		log.Info("%s", tr("LogRestartingTermService", "restarting TermService to clear patches (active RDP sessions will disconnect)..."))
+		if err := sysconfig.RestartTermService(log); err != nil {
+			return errors.Join(err, winsvc.Start())
 		}
 	}
 	log.Info("%s", tr("LogRestartingPatchService", "restarting patch service..."))
@@ -662,7 +745,7 @@ func GetStatus() Status {
 			p.Close()
 		}
 	}
-	s.Listener = sysconfig.IsListenerWorking()
+	s.Listener = sysconfig.ListenerReady(sysconfig.ListenerPort())
 	if st, err := winsvc.State(); err == nil {
 		s.ServiceInstalled = true
 		s.ServiceState = st

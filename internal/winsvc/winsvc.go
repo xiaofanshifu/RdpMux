@@ -80,6 +80,78 @@ func Restart() error {
 	return Start()
 }
 
+// StartOneShot creates a demand-start service that runs exePath with args and
+// starts it. The returned cleanup deletes the service record; the started
+// process should delete it too, because the caller may not survive the work.
+func StartOneShot(name, exePath string, args ...string) (func(), error) {
+	// Hold the image without write or delete sharing until the service has
+	// started. Otherwise anyone who can write to exePath's directory could
+	// replace it and have the replacement run as LocalSystem.
+	guard, err := lockImage(exePath)
+	if err != nil {
+		return nil, err
+	}
+	defer windows.CloseHandle(guard)
+	m, err := mgr.Connect()
+	if err != nil {
+		return nil, err
+	}
+	if s, err := m.OpenService(name); err == nil {
+		st, queryErr := s.Query()
+		if queryErr == nil && st.State != svc.Stopped {
+			s.Close()
+			m.Disconnect()
+			return nil, fmt.Errorf("service %s is still running", name)
+		}
+		_ = s.Delete()
+		s.Close()
+	}
+	s, err := m.CreateService(name, exePath, mgr.Config{
+		ServiceType:  windows.SERVICE_WIN32_OWN_PROCESS,
+		StartType:    mgr.StartManual,
+		ErrorControl: mgr.ErrorNormal,
+		DisplayName:  name,
+	}, args...)
+	if err != nil {
+		m.Disconnect()
+		return nil, err
+	}
+	if err := s.Start(); err != nil {
+		_ = s.Delete()
+		s.Close()
+		m.Disconnect()
+		return nil, err
+	}
+	return func() {
+		_ = s.Delete()
+		s.Close()
+		m.Disconnect()
+	}, nil
+}
+
+func lockImage(path string) (windows.Handle, error) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	return windows.CreateFile(p, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+}
+
+// DeleteOneShot removes a service created by StartOneShot.
+func DeleteOneShot(name string) error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+	s, err := m.OpenService(name)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.Delete()
+}
+
 func State() (svc.State, error) {
 	st, _, err := winutil.SvcQueryState(Name)
 	if err != nil {

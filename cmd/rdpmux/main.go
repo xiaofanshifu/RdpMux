@@ -225,6 +225,9 @@ func elevate(args []string) error {
 func run() error {
 	args := os.Args[1:]
 	loc.Init("", args)
+	if handled, err := app.ServeOperationHost(args); handled {
+		return err
+	}
 	level, args, err := parseFlags(args)
 	if err != nil {
 		return err
@@ -242,13 +245,9 @@ func run() error {
 	}
 	switch cmd {
 	case "install":
-		log, closeLog := app.NewLogger(level, os.Stdout)
-		defer closeLog()
-		return app.Install(log)
+		return app.RunOperation(app.OpInstall, level, os.Stdout)
 	case "uninstall":
-		log, closeLog := app.NewLogger(level, os.Stdout)
-		defer closeLog()
-		return app.Uninstall(log)
+		return app.RunOperation(app.OpUninstall, level, os.Stdout)
 	case "status":
 		log, closeLog := app.NewLogger(level, nil)
 		defer closeLog()
@@ -263,9 +262,7 @@ func run() error {
 		defer closeLog()
 		return app.Update(source, log)
 	case "restart":
-		log, closeLog := app.NewLogger(level, os.Stdout)
-		defer closeLog()
-		return app.RestartService(log)
+		return app.RunOperation(app.OpRestartService, level, os.Stdout)
 	case "patch":
 		log, closeLog := app.NewLogger(level, os.Stdout)
 		defer closeLog()

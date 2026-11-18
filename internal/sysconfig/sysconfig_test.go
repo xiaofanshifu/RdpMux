@@ -2,11 +2,15 @@ package sysconfig
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows"
+
+	"rdpmux/internal/winutil"
 )
 
 func TestRollbackAggregatesErrors(t *testing.T) {
@@ -48,6 +52,7 @@ func fakeTermServiceOps(events *[]string) termServiceOps {
 			*events = append(*events, "start "+name)
 			return nil
 		},
+		listener: func() bool { return true },
 	}
 }
 
@@ -127,5 +132,123 @@ func TestRestartTermServiceStartsStoppedTarget(t *testing.T) {
 	want := []string{"stop TermService", "start TermService"}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events = %v, want %v", events, want)
+	}
+}
+
+func TestRestartTermServiceAcceptsServiceReplacedWhileStopping(t *testing.T) {
+	var events []string
+	ops := fakeTermServiceOps(&events)
+	ops.stop = func(name string) error {
+		events = append(events, "stop "+name)
+		if name == "TermService" {
+			return fmt.Errorf("pid 5520 -> 1752: %w", winutil.ErrServiceReplaced)
+		}
+		return nil
+	}
+	if err := restartTermService(ops); err != nil {
+		t.Fatalf("a service restarted by the SCM was reported as failure: %v", err)
+	}
+	want := []string{"stop child", "stop dependent", "stop TermService", "start TermService", "start dependent", "start child"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+}
+
+func TestRestartTermServiceRejectsReplacedDependent(t *testing.T) {
+	var events []string
+	replacement := fmt.Errorf("pid 10 -> 20: %w", winutil.ErrServiceReplaced)
+	ops := fakeTermServiceOps(&events)
+	ops.stop = func(name string) error {
+		events = append(events, "stop "+name)
+		if name == "dependent" {
+			return replacement
+		}
+		return nil
+	}
+	err := restartTermService(ops)
+	if !errors.Is(err, replacement) {
+		t.Fatalf("error = %v, want the replacement error", err)
+	}
+	want := []string{"stop child", "stop dependent", "start dependent", "start child"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+}
+
+func TestRestartTermServiceRetriesStopThatNeverStarted(t *testing.T) {
+	var events []string
+	ops := fakeTermServiceOps(&events)
+	stops := 0
+	ops.stop = func(name string) error {
+		events = append(events, "stop "+name)
+		if name == "TermService" {
+			stops++
+			if stops == 1 {
+				return fmt.Errorf("no transition: %w", winutil.ErrStopNotStarted)
+			}
+		}
+		return nil
+	}
+	if err := restartTermService(ops); err != nil {
+		t.Fatalf("retry did not recover: %v", err)
+	}
+	want := []string{"stop child", "stop dependent", "stop TermService", "stop TermService", "start TermService", "start dependent", "start child"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+}
+
+func TestRestartTermServiceReportsPersistentStopFailure(t *testing.T) {
+	var events []string
+	ops := fakeTermServiceOps(&events)
+	stops := 0
+	ops.stop = func(name string) error {
+		events = append(events, "stop "+name)
+		if name == "TermService" {
+			stops++
+			return winutil.ErrStopNotStarted
+		}
+		return nil
+	}
+	err := restartTermService(ops)
+	if !errors.Is(err, winutil.ErrStopNotStarted) || stops != 2 {
+		t.Fatalf("stops = %d, error = %v", stops, err)
+	}
+}
+
+func TestRestartTermServiceReportsMissingListener(t *testing.T) {
+	var events []string
+	ops := fakeTermServiceOps(&events)
+	ops.listener = func() bool { return false }
+	err := restartTermService(ops)
+	if err == nil || !errors.Is(err, ErrListenerNotReady) || !strings.Contains(err.Error(), "listener") {
+		t.Fatalf("a missing listener was reported as success: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("listener was checked before the services were restarted")
+	}
+}
+
+func TestListenerReadyDetectsTCPListener(t *testing.T) {
+	for _, tc := range []struct{ network, addr string }{
+		{"tcp4", "127.0.0.1:0"},
+		{"tcp6", "[::1]:0"},
+	} {
+		t.Run(tc.network, func(t *testing.T) {
+			ln, err := net.Listen(tc.network, tc.addr)
+			if err != nil {
+				t.Skipf("%s is unavailable: %v", tc.network, err)
+			}
+			port := uint32(ln.Addr().(*net.TCPAddr).Port)
+			if !ListenerReady(port) {
+				t.Fatalf("port %d listens but was reported down", port)
+			}
+			if err := ln.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if ListenerReady(port) {
+				t.Fatalf("closed port %d was still reported as listening", port)
+			}
+		})
 	}
 }
