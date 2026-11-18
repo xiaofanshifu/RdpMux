@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
@@ -21,31 +22,35 @@ import (
 )
 
 type ui struct {
-	mw         *walk.MainWindow
-	body       *walk.ScrollView
-	footer     *walk.Composite
-	lsPatch    *walk.Label
-	lsService  *walk.Label
-	lsListener *walk.Label
-	lsTSVer    *walk.Label
-	lsSupport  *walk.Label
-	lsDB       *walk.Label
-	cbAllow    *walk.CheckBox
-	cbSingle   *walk.CheckBox
-	cbHide     *walk.CheckBox
-	cbCustom   *walk.CheckBox
-	nePort     *walk.NumberEdit
-	nla        []*walk.RadioButton
-	shadow     []*walk.RadioButton
-	cbLang     *walk.ComboBox
-	log        *walk.TextEdit
-	bApply     *walk.PushButton
-	dirty      bool
-	opBusy     bool
-	oldPort    uint32
-	stopCh     chan struct{}
-	lifecycle  sync.Mutex // serializes callback enqueueing with window disposal
-	nextState  *uiState
+	mw          *walk.MainWindow
+	body        *walk.Composite
+	footer      *walk.Composite
+	lsPatch     *walk.Label
+	lsService   *walk.Label
+	lsListener  *walk.Label
+	lsTSVer     *walk.Label
+	lsSupport   *walk.Label
+	lsDB        *walk.Label
+	dotService  *walk.Label
+	dotPatch    *walk.Label
+	dotListener *walk.Label
+	dotVersion  *walk.Label
+	cbAllow     *walk.CheckBox
+	cbSingle    *walk.CheckBox
+	cbHide      *walk.CheckBox
+	cbCustom    *walk.CheckBox
+	nePort      *walk.NumberEdit
+	nla         []*walk.RadioButton
+	shadow      []*walk.RadioButton
+	cbLang      *walk.ComboBox
+	log         *walk.TextEdit
+	bApply      *walk.PushButton
+	dirty       bool
+	opBusy      bool
+	oldPort     uint32
+	stopCh      chan struct{}
+	lifecycle   sync.Mutex // serializes callback enqueueing with window disposal
+	nextState   *uiState
 
 	backend       guiBackend
 	enqueue       func(func())
@@ -108,6 +113,21 @@ func msg(key, def string, args ...any) string {
 	return loc.LF("Messages", key, def, args...)
 }
 
+const spiGetWorkArea = 0x0030
+
+var (
+	colorOK    = walk.RGB(0x1b, 0x7f, 0x3b)
+	colorBad   = walk.RGB(0xc0, 0x35, 0x2b)
+	colorIdle  = walk.RGB(0x80, 0x80, 0x80)
+	colorMuted = walk.RGB(0x60, 0x60, 0x60)
+)
+
+func setDot(label *walk.Label, color walk.Color) {
+	if label != nil {
+		label.SetTextColor(color)
+	}
+}
+
 func Run() {
 	loc.Init("", nil)
 	_ = winutil.EnablePrivilege("SeDebugPrivilege")
@@ -122,6 +142,10 @@ func Run() {
 			u.restore(*carry)
 		} else {
 			u.readSettings()
+			u.centerOnScreen()
+			// The first ShowWindow still applies the startup placement, so
+			// center again as soon as the message loop is running.
+			u.mw.Starting().Attach(func() { u.mw.Synchronize(u.centerOnScreen) })
 		}
 		u.refreshStatusAsync()
 		go u.tick()
@@ -169,84 +193,37 @@ func (u *ui) build() error {
 		return s
 	}()
 
+	// The language font must be set before the controls are created: applying it
+	// afterwards walks the whole tree and relayouts once per widget (~10s).
+	windowFont := Font{}
+	if family := loc.CurrentLanguageFont(); family != "" {
+		windowFont = Font{Family: family, PointSize: 9}
+	}
+
 	err := MainWindow{
 		AssignTo: &u.mw,
 		Title:    mf("AppTitle", "RdpMux - RDP Configuration"),
-		Size:     Size{Width: 720, Height: 720},
-		MinSize:  Size{Width: 620, Height: 480},
-		Layout:   VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 8}, Spacing: 6},
+		Font:     windowFont,
+		Size:     Size{Width: 850, Height: 680},
+		MinSize:  Size{Width: 800, Height: 640},
+		Layout: VBox{
+			Margins:   Margins{Left: 10, Top: 10, Right: 10, Bottom: 10},
+			Spacing:   8,
+			Alignment: AlignHNearVNear,
+		},
 		Children: []Widget{
-			ScrollView{
+			u.statusStrip(),
+			Composite{
 				AssignTo: &u.body,
-				Layout:   VBox{Spacing: 6},
+				Layout:   HBox{Spacing: 10, MarginsZero: true, Alignment: AlignHNearVNear},
+				MaxSize:  Size{Width: 32767, Height: 32767},
 				Children: []Widget{
-					GroupBox{
-						Title:  mf("gbDiag.Caption", "Diagnostics"),
-						Layout: VBox{Spacing: 4},
-						Children: []Widget{
-							u.diagRow(mf("lPatch.Caption", "Patch state:"), &u.lsPatch),
-							u.diagRow(mf("lService.Caption", "Service state:"), &u.lsService),
-							u.diagRow(mf("lListener.Caption", "Listener state:"), &u.lsListener),
-							Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
-								Label{Text: mf("lTSVer.Caption", "termsrv ver."), MinSize: Size{Width: 110}},
-								Label{AssignTo: &u.lsTSVer, Text: "-"},
-								Label{AssignTo: &u.lsSupport, Text: ""},
-							}},
-							u.diagRow(mf("lDB.Caption", "Patch DB:"), &u.lsDB),
-						},
-					},
-					GroupBox{
-						Title:  mf("gbGeneral.Caption", "General Settings"),
-						Layout: VBox{Spacing: 4},
-						Children: []Widget{
-							CheckBox{AssignTo: &u.cbAllow, Text: mf("cbAllowTSConnections.Caption", "Enable Remote Desktop"), OnCheckedChanged: u.markDirty},
-							Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
-								Label{Text: mf("lRDPPort.Caption", "RDP port:"), MinSize: Size{Width: 110}},
-								NumberEdit{AssignTo: &u.nePort, MinValue: 1, MaxValue: 65535, Decimals: 0, OnValueChanged: u.markDirty, MaxSize: Size{Width: 100}, ToolTipText: mf("nePort.ToolTip", "Make sure Windows Firewall allows this port; RdpMux does not manage firewall rules.")},
-							}},
-							CheckBox{AssignTo: &u.cbSingle, Text: mf("cbSingleSessionPerUser.Caption", "Single session per user"), OnCheckedChanged: u.markDirty},
-							CheckBox{AssignTo: &u.cbHide, Text: mf("cbHideUsers.Caption", "Hide users on logon screen"), OnCheckedChanged: u.markDirty},
-							CheckBox{AssignTo: &u.cbCustom, Text: mf("cbCustomPrg.Caption", "Allow unlisted RemoteApps"), OnCheckedChanged: u.markDirty},
-							Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
-								GroupBox{Title: mf("rgNLA.Caption", "Authentication Mode"), Layout: VBox{Spacing: 2}, Children: nlaButtons},
-								GroupBox{Title: mf("rgShadow.Caption", "Session Shadowing Mode"), Layout: VBox{Spacing: 2}, Children: shadowButtons},
-							}},
-						},
-					},
-					GroupBox{
-						Title:  mf("gbLocalRDPChecker.Caption", "Check your settings with mstsc"),
-						Layout: HBox{Spacing: 6},
-						Children: []Widget{
-							PushButton{Text: mf("bmstsc.Caption", "Fullscreen"), OnClicked: func() { u.mstsc("/f") }},
-							PushButton{Text: mf("b800x600.Caption", "800x600"), OnClicked: func() { u.mstsc("/w:800 /h:600") }},
-							PushButton{Text: mf("b1024x768.Caption", "1024x768"), OnClicked: func() { u.mstsc("/w:1024 /h:768") }},
-							PushButton{Text: mf("b1366x768.Caption", "1366x768"), OnClicked: func() { u.mstsc("/w:1366 /h:768") }},
-							PushButton{Text: mf("b1920x1080.Caption", "1920x1080"), OnClicked: func() { u.mstsc("/w:1920 /h:1080") }},
-						},
-					},
-					Composite{Layout: VBox{Spacing: 6}, Children: []Widget{
-						Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
-							PushButton{Text: mf("bInstall.Caption", "Install"), OnClicked: func() {
-								u.runOperation(msg("OpInstall", "install"), app.OpInstall)
-							}},
-							PushButton{Text: mf("bUninstall.Caption", "Uninstall"), OnClicked: u.onUninstall},
-							PushButton{Text: mf("bUpdateINI.Caption", "Update INI"), ToolTipText: mf("bUpdateINI.ToolTip", "Only downloads the latest patch database from GitHub; it does not apply it. Use Restart Service to apply."), OnClicked: func() {
-								u.runOp(msg("OpUpdate", "update"), func(log *logx.Logger) error { return app.Update("", log) })
-							}},
-						}},
-						Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
-							PushButton{Text: mf("bRestartService.Caption", "Restart Service"), ToolTipText: mf("bRestartService.ToolTip", "Restarts the RdpMux service to load and apply the current patch database. If the patches for the running termsrv version changed, TermService is also restarted (active RDP sessions disconnect)."), OnClicked: func() {
-								u.runOperation(msg("OpRestartService", "restart service"), app.OpRestartService)
-							}},
-							PushButton{Text: mf("bRestartTS.Caption", "Restart TermService"), ToolTipText: mf("bRestartTS.ToolTip", "Restarts TermService only (disconnects active RDP sessions). Does not reload the patch database; use Restart Service to apply an updated database."), OnClicked: func() {
-								u.runOperation(msg("OpRestart", "restart"), app.OpRestartTerm)
-							}},
-						}},
-					}},
-					TextEdit{AssignTo: &u.log, ReadOnly: true, VScroll: true, MinSize: Size{Height: 90}},
+					u.actionColumn(),
+					u.settingsGroup(nlaButtons, shadowButtons),
 				},
 			},
-			Composite{AssignTo: &u.footer, Layout: HBox{Spacing: 6}, Children: []Widget{
+			u.logPanel(),
+			Composite{AssignTo: &u.footer, Layout: HBox{Spacing: 6, MarginsZero: true, Alignment: AlignHNearVNear}, Children: []Widget{
 				Label{Text: mf("lLanguage.Caption", "Language:")},
 				ComboBox{AssignTo: &u.cbLang, Model: langNames, MaxSize: Size{Width: 140}, OnCurrentIndexChanged: u.onLanguage},
 				HSpacer{},
@@ -262,12 +239,160 @@ func (u *ui) build() error {
 	u.mw.Disposing().Attach(u.stop)
 	u.mw.Closing().Attach(u.onClosing)
 	u.setLangCombo()
-	if font := loc.CurrentLanguageFont(); font != "" {
-		if f, err := walk.NewFont(font, 9, 0); err == nil {
-			u.mw.SetFont(f)
-		}
-	}
 	return nil
+}
+
+// The strip answers "can I connect right now" without reading the log.
+func (u *ui) statusStrip() Widget {
+	return Composite{
+		Layout:  HBox{Spacing: 28, MarginsZero: true, Alignment: AlignHNearVNear},
+		MaxSize: Size{Width: 32767},
+		Children: []Widget{
+			statusItem(mf("sbService.Caption", "Service"), &u.dotService, &u.lsService),
+			statusItem(mf("sbPatch.Caption", "Patch"), &u.dotPatch, &u.lsPatch),
+			statusItem(mf("sbListener.Caption", "Listener"), &u.dotListener, &u.lsListener),
+			statusItem(mf("lTSVer.Caption", "termsrv ver."), &u.dotVersion, &u.lsTSVer, &u.lsSupport),
+		},
+	}
+}
+
+func statusItem(caption string, dot **walk.Label, values ...**walk.Label) Widget {
+	row := []Widget{Label{AssignTo: dot, Text: "●", TextColor: colorIdle}}
+	for i, v := range values {
+		text := ""
+		if i == 0 {
+			text = "-"
+		}
+		row = append(row, Label{AssignTo: v, Text: text})
+	}
+	return Composite{
+		Layout: VBox{Spacing: 2, MarginsZero: true, Alignment: AlignHNearVNear},
+		Children: []Widget{
+			Label{Text: caption, TextColor: colorMuted},
+			Composite{Layout: HBox{Spacing: 6, MarginsZero: true, Alignment: AlignHNearVNear}, Children: row},
+		},
+	}
+}
+
+// Operations live in a fixed-width column so the settings keep a stable place.
+func (u *ui) actionColumn() Widget {
+	button := func(text, tooltip string, onClick func()) PushButton {
+		return PushButton{Text: text, ToolTipText: tooltip, MaxSize: Size{Width: 32767}, OnClicked: onClick}
+	}
+	row := func(children ...Widget) Widget {
+		return Composite{Layout: HBox{Spacing: 6, MarginsZero: true, Alignment: AlignHNearVNear}, Children: children}
+	}
+	return Composite{
+		Layout:  VBox{Spacing: 8, MarginsZero: true, Alignment: AlignHNearVNear},
+		MinSize: Size{Width: 320},
+		MaxSize: Size{Width: 320},
+		Children: []Widget{
+			GroupBox{
+				Title:   mf("gbActions.Caption", "Actions"),
+				Layout:  VBox{Spacing: 10, Alignment: AlignHNearVNear},
+				MaxSize: Size{Width: 32767},
+				Children: []Widget{
+					row(Label{Text: mf("lDB.Caption", "Patch DB:")}, Label{AssignTo: &u.lsDB, Text: "-"}),
+					row(
+						button(mf("bInstall.Caption", "Install"), "", func() {
+							u.runOperation(msg("OpInstall", "install"), app.OpInstall)
+						}),
+						button(mf("bUpdateINI.Caption", "Update INI"), mf("bUpdateINI.ToolTip", "Only downloads the latest patch database from GitHub; it does not apply it. Use Restart Service to apply."), func() {
+							u.runOp(msg("OpUpdate", "update"), func(log *logx.Logger) error { return app.Update("", log) })
+						}),
+					),
+					row(
+						button(mf("bRestartService.Caption", "Restart Service"), mf("bRestartService.ToolTip", "Restarts the RdpMux service to load and apply the current patch database. If the patches for the running termsrv version changed, TermService is also restarted (active RDP sessions disconnect)."), func() {
+							u.runOperation(msg("OpRestartService", "restart service"), app.OpRestartService)
+						}),
+						button(mf("bRestartTS.Caption", "Restart TermService"), mf("bRestartTS.ToolTip", "Restarts TermService only (disconnects active RDP sessions). Does not reload the patch database; use Restart Service to apply an updated database."), func() {
+							u.runOperation(msg("OpRestart", "restart"), app.OpRestartTerm)
+						}),
+					),
+					row(button(mf("bUninstall.Caption", "Uninstall"), "", u.onUninstall), HSpacer{}),
+					VSpacer{},
+				},
+			},
+			GroupBox{
+				Title:   mf("gbTest.Caption", "Test connection"),
+				Layout:  VBox{Spacing: 10, Alignment: AlignHNearVNear},
+				MaxSize: Size{Width: 32767},
+				Children: []Widget{
+					row(button(mf("bmstsc.Caption", "Fullscreen"), "", func() { u.mstsc("/f") })),
+					row(
+						button(mf("b800x600.Caption", "800x600"), "", func() { u.mstsc("/w:800 /h:600") }),
+						button(mf("b1024x768.Caption", "1024x768"), "", func() { u.mstsc("/w:1024 /h:768") }),
+					),
+					row(
+						button(mf("b1366x768.Caption", "1366x768"), "", func() { u.mstsc("/w:1366 /h:768") }),
+						button(mf("b1920x1080.Caption", "1920x1080"), "", func() { u.mstsc("/w:1920 /h:1080") }),
+					),
+					VSpacer{},
+				},
+			},
+		},
+	}
+}
+
+func (u *ui) settingsGroup(nla, shadow []Widget) Widget {
+	return GroupBox{
+		Title:  mf("gbGeneral.Caption", "General Settings"),
+		Layout: VBox{Spacing: 6, Alignment: AlignHNearVNear},
+		Children: []Widget{
+			CheckBox{AssignTo: &u.cbAllow, Text: mf("cbAllowTSConnections.Caption", "Enable Remote Desktop"), OnCheckedChanged: u.markDirty},
+			Composite{Layout: HBox{Spacing: 8, MarginsZero: true, Alignment: AlignHNearVNear}, Children: []Widget{
+				Label{Text: mf("lRDPPort.Caption", "RDP port:"), MinSize: Size{Width: 76}},
+				NumberEdit{AssignTo: &u.nePort, MinValue: 1, MaxValue: 65535, Decimals: 0, OnValueChanged: u.markDirty, MinSize: Size{Width: 90}, MaxSize: Size{Width: 100}, ToolTipText: mf("nePort.ToolTip", "Make sure Windows Firewall allows this port; RdpMux does not manage firewall rules.")},
+				HSpacer{},
+			}},
+			CheckBox{AssignTo: &u.cbSingle, Text: mf("cbSingleSessionPerUser.Caption", "Single session per user"), OnCheckedChanged: u.markDirty},
+			CheckBox{AssignTo: &u.cbHide, Text: mf("cbHideUsers.Caption", "Hide users on logon screen"), OnCheckedChanged: u.markDirty},
+			CheckBox{AssignTo: &u.cbCustom, Text: mf("cbCustomPrg.Caption", "Allow unlisted RemoteApps"), OnCheckedChanged: u.markDirty},
+			Composite{Layout: HBox{Spacing: 8, MarginsZero: true, Alignment: AlignHNearVNear}, Children: []Widget{
+				GroupBox{Title: mf("rgNLA.Caption", "Authentication Mode"), Layout: VBox{Spacing: 4, Alignment: AlignHNearVNear}, Children: nla},
+				GroupBox{Title: mf("rgShadow.Caption", "Session Shadowing Mode"), Layout: VBox{Spacing: 4, Alignment: AlignHNearVNear}, Children: shadow},
+				HSpacer{},
+			}},
+			// Spacers make this group report growable, so it fills the free space.
+			HSpacer{},
+			VSpacer{},
+		},
+	}
+}
+
+// The log is fixed to the window, so operation output never scrolls away.
+func (u *ui) logPanel() Widget {
+	return GroupBox{
+		Title:   mf("gbLog.Caption", "Log"),
+		Layout:  VBox{Spacing: 4, Alignment: AlignHNearVNear},
+		MinSize: Size{Height: 120},
+		MaxSize: Size{Width: 32767, Height: 240},
+		Children: []Widget{
+			TextEdit{AssignTo: &u.log, ReadOnly: true, VScroll: true, MaxSize: Size{Width: 32767, Height: 32767}},
+		},
+	}
+}
+
+// centerOnScreen replaces the CW_USEDEFAULT cascade position and keeps the
+// window inside the work area of small screens.
+func (u *ui) centerOnScreen() {
+	var work win.RECT
+	if !win.SystemParametersInfo(spiGetWorkArea, 0, unsafe.Pointer(&work), 0) {
+		return
+	}
+	workWidth, workHeight := int(work.Right-work.Left), int(work.Bottom-work.Top)
+	if workWidth <= 0 || workHeight <= 0 {
+		return
+	}
+	b := u.mw.BoundsPixels()
+	width, height := min(b.Width, workWidth), min(b.Height, workHeight)
+	bounds := walk.Rectangle{
+		X:      int(work.Left) + (workWidth-width)/2,
+		Y:      int(work.Top) + (workHeight-height)/2,
+		Width:  width,
+		Height: height,
+	}
+	_ = u.mw.SetBoundsPixels(bounds)
 }
 
 func (u *ui) onClosing(canceled *bool, reason walk.CloseReason) {
@@ -325,13 +450,6 @@ func (u *ui) restore(s uiState) {
 	if !s.bounds.IsZero() {
 		u.mw.SetBounds(s.bounds)
 	}
-}
-
-func (u *ui) diagRow(caption string, target **walk.Label) Widget {
-	return Composite{Layout: HBox{Spacing: 6}, Children: []Widget{
-		Label{Text: caption, MinSize: Size{Width: 110}},
-		Label{AssignTo: target, Text: "-"},
-	}}
 }
 
 func (u *ui) markDirty() {
@@ -658,6 +776,7 @@ func (u *ui) refreshStatusAsync() <-chan struct{} {
 }
 
 func (u *ui) applyStatus(s app.Status) {
+	versionColor := colorIdle
 	if s.TermsrvErr != nil {
 		u.lsTSVer.SetText(st("NA", "N/A"))
 		u.lsSupport.SetText("")
@@ -665,36 +784,52 @@ func (u *ui) applyStatus(s app.Status) {
 		u.lsTSVer.SetText(s.TermsrvVersion)
 		if s.Supported {
 			u.lsSupport.SetText(st("FullySupported", "[fully supported]"))
+			versionColor = colorOK
 		} else {
 			u.lsSupport.SetText(st("NotSupported", "[not supported]"))
+			versionColor = colorBad
 		}
 	}
+	setDot(u.dotVersion, versionColor)
 	if s.DBErr != nil {
 		u.lsDB.SetText(s.DBErr.Error())
 	} else {
 		u.lsDB.SetText(s.DBUpdated)
 	}
+	serviceColor := colorBad
 	if s.TermErr != nil {
 		u.lsService.SetText(st("Unknown", "Unknown"))
+		serviceColor = colorIdle
 	} else {
 		u.lsService.SetText(fmt.Sprintf("%s (pid %d)", termStateText(s.TermState), s.TermPID))
+		if s.TermState == 4 {
+			serviceColor = colorOK
+		}
 	}
+	setDot(u.dotService, serviceColor)
+	patchColor := colorBad
 	switch {
 	case s.TermErr != nil || s.TermState != 4:
 		u.lsPatch.SetText(st("NA", "N/A"))
+		patchColor = colorIdle
 	case s.PatchNeedAdmin:
 		u.lsPatch.SetText(st("NeedAdmin", "run as administrator"))
+		patchColor = colorIdle
 	case s.PatchErr != nil:
 		u.lsPatch.SetText(s.PatchErr.Error())
 	case s.PatchActive:
 		u.lsPatch.SetText(st("Patched", "ACTIVE"))
+		patchColor = colorOK
 	default:
 		u.lsPatch.SetText(st("NotPatched", "inactive"))
 	}
+	setDot(u.dotPatch, patchColor)
 	if s.Listener {
 		u.lsListener.SetText(st("Listening", "Listening"))
+		setDot(u.dotListener, colorOK)
 	} else {
 		u.lsListener.SetText(st("NotListening", "Not listening"))
+		setDot(u.dotListener, colorBad)
 	}
 }
 
