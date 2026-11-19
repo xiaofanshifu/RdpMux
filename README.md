@@ -24,13 +24,19 @@ RDP 协议栈本身支持多会话；客户端版受限主要来自软件许可�
 - 目标系统的 `termsrv.dll` 版本必须包含在补丁库 `rdpwrap.ini` 中。
 - 从源码构建需要 Go 1.27.3 或更高版本。
 
-## 构建
+## 下载
+
+正式发布的 exe 在 [GitHub Releases](https://github.com/xiaofanshifu/RdpMux/releases) 页面获取。`rdpwrap.ini`、语言文件和 `rfxvmt.dll` 均已内嵌，下载 `rdpmux.exe` 与 `rdpmuxgui.exe` 后放在同一目录即可使用，无需其他文件。
+
+二进制未做代码签名，首次运行时 Windows SmartScreen 可能提示"Windows 已保护你的电脑"，选择"更多信息" → "仍要运行"即可。
+
+## 从源码构建
 
 ```bat
 build.bat
 ```
 
-产物为 `bin\rdpmux.exe` 和 `bin\rdpmuxgui.exe`。
+产物为 `bin\rdpmux.exe` 和 `bin\rdpmuxgui.exe`，目录已加入 `.gitignore`，不纳入版本控制。发布由推送 `v*` 标签触发 GitHub Actions 自动完成。
 
 ## 命令
 
